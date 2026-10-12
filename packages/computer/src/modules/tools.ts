@@ -68,9 +68,10 @@ export interface ToolBindingsOptions {
   readonly description?: string;
 }
 
-// The JavaScript backend's own rule for host module export names.
-const EXPORT_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const RESERVED_EXPORT_NAMES = new Set(["default", "then"]);
+// Names an identifier can spell but an export cannot use. The backend
+// refuses `default` and `then`, and assigning `__proto__` to the
+// exports object would replace its prototype instead of adding one.
+const RESERVED_EXPORT_NAMES = new Set(["default", "then", "__proto__"]);
 
 /**
  * Build the `ws:tools` host module.
@@ -83,8 +84,8 @@ const RESERVED_EXPORT_NAMES = new Set(["default", "then"]);
  * @param bindings - The tools, or a function returning them.
  * @param options - Tools to leave out, and a replacement description.
  * @returns The module to pass as `modules["ws:tools"]`.
- * @throws When the backend connects, if a tool's name cannot be an
- *   export name or two tools share a name.
+ * @throws When the backend connects, if two tools share an export name
+ *   once their names are made into identifiers.
  */
 export function createToolBindings(
   bindings: ToolBindings,
@@ -95,11 +96,11 @@ export function createToolBindings(
     const functions: Record<string, WorkspaceModuleFunction> = {};
     for (const binding of typeof bindings === "function" ? bindings() : bindings) {
       if (exclude.has(binding.name)) continue;
-      assertExportName(binding.name);
-      if (Object.hasOwn(functions, binding.name)) {
-        throw new Error(`Two tools are named ${JSON.stringify(binding.name)}.`);
+      const name = exportName(binding.name);
+      if (Object.hasOwn(functions, name)) {
+        throw new Error(`Two tools are exported as ${JSON.stringify(name)}.`);
       }
-      functions[binding.name] = async (args, context) => {
+      functions[name] = async (args, context) => {
         if (binding.readOnly !== true && context.access !== "read-write") {
           throw new Error(`ws:tools ${binding.name} requires Workspace write access.`);
         }
@@ -113,11 +114,19 @@ export function createToolBindings(
   });
 }
 
-function assertExportName(name: string) {
-  if (EXPORT_NAME.test(name) && !RESERVED_EXPORT_NAMES.has(name)) return;
-  throw new Error(
-    `Tool ${JSON.stringify(name)} cannot be exported from ws:tools: export names must be JavaScript identifiers, and not "default" or "then". Leave it out with the exclude option.`,
-  );
+/**
+ * Turn a tool name into an export name: separators become `_`, other
+ * characters that cannot appear in an identifier are dropped, a leading
+ * digit gets a `_` in front, and `default`, `then`, and `__proto__` get
+ * one behind.
+ * `list-files` becomes `list_files`.
+ */
+function exportName(toolName: string): string {
+  let name = toolName.replace(/[-.\s]/g, "_").replace(/[^A-Za-z0-9_$]/g, "");
+  if (name === "") return "_";
+  if (/^[0-9]/.test(name)) name = `_${name}`;
+  if (RESERVED_EXPORT_NAMES.has(name)) name = `${name}_`;
+  return name;
 }
 
 function singleObject(
@@ -135,7 +144,7 @@ function singleObject(
 // is constructed, before a function of tools has run.
 function describe(excluded: readonly string[]): string {
   const base =
-    "The agent's own tools, callable from code, under the same names. Each takes one object of the tool's arguments and returns `{ text, details, isError }`.";
+    "The agent's own tools, callable from code. Each is exported under its name made into an identifier: `-`, `.`, and spaces become `_`, and other characters an identifier cannot hold are dropped, so `list-files` becomes `list_files`. Each takes one object of the tool's arguments and returns `{ text, details, isError }`.";
   if (excluded.length === 0) return base;
   const names = excluded.map((name) => `\`${name}\``);
   return excluded.length === 1

@@ -312,7 +312,18 @@ new WorkerJavaScriptBackend({
 
 `forPiTools()` takes executable tools in the shape `@earendil-works/pi-agent-core` defines, or the result of `createPiTools()`. It runs a call the way pi's agent loop runs a model's call: `prepareArguments`, then `validate`, then `execute` with a fresh call id and the call's abort signal. Pass pi-ai's `validateToolArguments` as `validate` to hold code to the same check as the model; without it, arguments reach the tool unchecked. Text parts of the result are joined, and an image is named in place, as `[image: image/png]`.
 
-Pass a function of tools, rather than a list, when the tools need something that does not exist yet when the backend is constructed, such as the Workspace they act on. The function runs each time the backend connects. A tool whose name cannot be a JavaScript export, such as `list-files`, fails the connection with a message naming it; leave it out with `exclude`.
+`forAISDKTools()` from `@cloudflare/computer/tools/ai-sdk` builds them from an AI SDK tool set:
+
+```ts
+import { createToolBindings } from "@cloudflare/computer/modules/tools";
+import { forAISDKTools } from "@cloudflare/computer/tools/ai-sdk";
+
+"ws:tools": createToolBindings(forAISDKTools(() => agentTools))
+```
+
+It checks the code's arguments against the tool's `inputSchema`, as the AI SDK checks a model's call, and calls `execute` with the parsed value, a fresh call id, and the call's abort signal. Arguments that fail the check reject the call, and a schema's defaults apply. A string result becomes the text; anything else is the JSON text, and `details` holds the value. A result shaped `{ error: string }`, which is how this package's tools report a failure such as a missing file, comes back with `isError: true` and the message as the text. A streaming tool resolves with its last value. Tools with no `execute` function, which run in the browser, and tools that set `needsApproval` are left out, because nothing can approve or run them from code. With a function of tools, a call runs the tool the function returns at that moment, so an agent can swap its tool set between turns without the module going stale.
+
+Pass a function of tools, rather than a list, when the tools need something that does not exist yet when the backend is constructed, such as the Workspace they act on. The function runs each time the backend connects. A tool whose name cannot be a JavaScript export is exported under a normalized name: `-`, `.`, and spaces become `_`, other characters an identifier cannot hold are dropped, a leading digit gets a `_` in front, and `default`, `then`, and `__proto__` get one behind, so `list-files` becomes `list_files`. Two tools that normalize to the same name fail the connection.
 
 On a backend with `access: "read"`, only tools marked `readOnly` run. Every other call is refused before the tool runs, as `ws:git` and `ws:container` refuse to write there. `createToolBindings()` cannot tell what a tool does, so an unmarked tool is taken to write. `forPiTools()` marks `read`, `ls`, `find`, and `grep` from `createPiTools()`. For your own pi tools, name the ones that only read: `forPiTools(tools, { readOnly: ["read", "grep"] })`.
 
