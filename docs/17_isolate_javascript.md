@@ -148,7 +148,7 @@ Caller source can import four kinds of module, and all of them are fixed when th
 | Built in | Always installed | The isolate, backed by the Workspace | `node:fs`, `node:fs/promises` |
 | Node.js | `nodejs_compat` in `compatibilityFlags`, the default | The isolate, provided by the runtime | `node:path`, `node:crypto` |
 | Source | `modules: { name: "source" }` | The isolate | a bundled library |
-| Host | `modules: { "ws:name": { fn } }`, or a factory | The Durable Object | `ws:git`, `ws:container`, your own |
+| Host | `modules: { "ws:name": { fn } }`, or a factory | The Durable Object | `ws:git`, `ws:container`, `ws:tools`, your own |
 
 ```ts
 import { createArtifactsModule } from "@cloudflare/computer/modules/artifacts";
@@ -258,7 +258,7 @@ Each function receives the arguments the isolate passed, as an array of JSON-com
 
 The arguments come from caller code, so parse them before use. A function may return a value or a promise. Arguments and results cross the isolate boundary as real values through Workers RPC, not as encoded text. The result must be JSON-compatible plain data, and the bridge checks it at runtime. As in JSON, an `undefined` result or array item becomes `null` and an `undefined` object field is left out, in arguments and results alike. Byte arrays work for `node:fs` calls but not for host modules. It fits within the same capability byte limits as every other host call. A function that ignores `signal` and never settles keeps the execution in its finalizing state.
 
-Specifiers and the export names of an object are checked at construction. A factory's export names are checked when the backend connects and the factory runs. A module must export at least one function, and every export name must be a JavaScript identifier name other than `default` or `then`. A reserved word such as `delete` is allowed, and caller code renames it on import: `import { delete as remove } from "ws:files"`. Importing a name the module does not export fails when the module graph links, before any code runs.
+Specifiers and the export names of an object are checked at construction. A factory's export names are checked when the backend connects and the factory runs. An object must export at least one function. A factory may build none, as `ws:tools` does for an agent with no tools: the backend then leaves that module out of the connection, so only code that imports it fails, with a message saying the module exports nothing, and every other run still starts. Every export name must be a JavaScript identifier name other than `default` or `then`. A reserved word such as `delete` is allowed, and caller code renames it on import: `import { delete as remove } from "ws:files"`. Importing a name the module does not export fails when the module graph links, before any code runs.
 
 ### `ws:git`
 
@@ -275,6 +275,46 @@ import { create, get, list, importArtifact, deleteArtifact } from "ws:artifacts"
 ```
 
 `createArtifactsModule()` from `@cloudflare/computer/modules/artifacts` wraps the Workspace's Artifacts client. Calls that change Artifacts need a read-write backend. `importArtifact()` fetches from a caller-chosen URL on the host, so it is denied unless you pass `createArtifactsModule({ allowNetwork: true })`. Every call fails clearly when no Artifacts binding is configured.
+
+### `ws:tools`
+
+`createToolBindings()` from `@cloudflare/computer/modules/tools` exports the agent's own tools to JavaScript, each under its own name. A loop over a hundred files is then one `exec` call instead of a hundred model turns:
+
+```js
+import { grep, read } from "ws:tools";
+
+export default async function ({ files }) {
+  const todos = {};
+  for (const path of files) {
+    const { text, isError } = await grep({ query: "TODO", path });
+    if (!isError && text.trim()) todos[path] = text;
+  }
+  return todos;
+}
+```
+
+Each export takes one object of the tool's arguments, the same object the model would pass, and resolves with `{ text, details, isError }`, plus `structuredContent` when the tool returns it. A tool that throws rejects the call. `exec` is left out by default, since the code is already running inside `exec` and a run that can start runs has no bound on how deep it goes. Pass `exclude` to change the list.
+
+What a tool is and how it runs belongs to the agent library, so `createToolBindings()` takes bindings: a name, and a function to call with the input and the call's context. `forPiTools()` from `@cloudflare/computer/tools/pi-ai` builds them from pi tools:
+
+```ts
+import { validateToolArguments } from "@earendil-works/pi-ai";
+import { createToolBindings } from "@cloudflare/computer/modules/tools";
+import { forPiTools } from "@cloudflare/computer/tools/pi-ai";
+
+new WorkerJavaScriptBackend({
+  loader: env.LOADER,
+  modules: {
+    "ws:tools": createToolBindings(forPiTools(() => agent.tools, { validate: validateToolArguments })),
+  },
+});
+```
+
+`forPiTools()` takes executable tools in the shape `@earendil-works/pi-agent-core` defines, or the result of `createPiTools()`. It runs a call the way pi's agent loop runs a model's call: `prepareArguments`, then `validate`, then `execute` with a fresh call id and the call's abort signal. Pass pi-ai's `validateToolArguments` as `validate` to hold code to the same check as the model; without it, arguments reach the tool unchecked. Text parts of the result are joined, and an image is named in place, as `[image: image/png]`.
+
+Pass a function of tools, rather than a list, when the tools need something that does not exist yet when the backend is constructed, such as the Workspace they act on. The function runs each time the backend connects. A tool whose name cannot be a JavaScript export, such as `list-files`, fails the connection with a message naming it; leave it out with `exclude`.
+
+On a backend with `access: "read"`, only tools marked `readOnly` run. Every other call is refused before the tool runs, as `ws:git` and `ws:container` refuse to write there. `createToolBindings()` cannot tell what a tool does, so an unmarked tool is taken to write. `forPiTools()` marks `read`, `ls`, `find`, and `grep` from `createPiTools()`. For your own pi tools, name the ones that only read: `forPiTools(tools, { readOnly: ["read", "grep"] })`.
 
 ### `ws:container`
 
