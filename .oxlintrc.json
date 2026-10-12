@@ -299,18 +299,6 @@
     "unicorn/no-useless-length-check": "error",
     "unicorn/prefer-set-size": "error",
     "unicorn/prefer-string-starts-ends-with": "error",
-    "vitest/hoisted-apis-on-top": "error",
-    "vitest/no-conditional-tests": "error",
-    "vitest/no-disabled-tests": "error",
-    "vitest/no-focused-tests": "error",
-    "vitest/no-standalone-expect": "error",
-    "vitest/prefer-snapshot-hint": "error",
-    "vitest/require-awaited-expect-poll": "error",
-    "vitest/require-local-test-context-for-concurrent-snapshots": "error",
-    "vitest/valid-describe-callback": "error",
-    "vitest/valid-expect-in-promise": "error",
-    "vitest/valid-title": "error",
-    "vitest/warn-todo": "error",
     "eslint/block-scoped-var": "warn",
     "eslint/no-extend-native": "warn",
     "eslint/no-extra-bind": "warn",
@@ -358,6 +346,53 @@
     "typescript/prefer-find": "warn",
     "typescript/prefer-reduce-type-parameter": "warn",
     "typescript/prefer-return-this-type": "warn",
-    "typescript/prefer-string-starts-ends-with": "warn"
-  }
+    "typescript/prefer-string-starts-ends-with": "warn",
+
+    "typescript/await-thenable": "error",
+    "typescript/no-floating-promises": [
+      "error",
+      { "allowForKnownSafeCalls": [{ "from": "package", "name": "test", "package": "node:test" }] }
+    ],
+    "typescript/no-misused-promises": "error",
+    "typescript/only-throw-error": [
+      "error",
+      { "allowThrowingAny": true, "allowThrowingUnknown": true }
+    ],
+    "typescript/switch-exhaustiveness-check": [
+      "error",
+      { "considerDefaultExhaustiveForUnions": true }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx", "**/*.bench.ts"],
+      "rules": {
+        "vitest/expect-expect": [
+          "error",
+          { "assertFunctionNames": ["expect", "assert*", "rejects", "eventually"] }
+        ],
+        "vitest/hoisted-apis-on-top": "error",
+        "vitest/no-commented-out-tests": "error",
+        "vitest/no-conditional-expect": "error",
+        "vitest/no-conditional-tests": "error",
+        "vitest/no-disabled-tests": "error",
+        "vitest/no-focused-tests": "error",
+        "vitest/no-standalone-expect": "error",
+        "vitest/prefer-snapshot-hint": "error",
+        "vitest/require-awaited-expect-poll": "error",
+        "vitest/require-local-test-context-for-concurrent-snapshots": "error",
+        "vitest/require-mock-type-parameters": "error",
+        "vitest/require-to-throw-message": "error",
+        "vitest/valid-describe-callback": "error",
+        "vitest/valid-expect": ["error", { "maxArgs": 2 }],
+        "vitest/valid-expect-in-promise": "error",
+        "vitest/valid-title": "error",
+        "vitest/warn-todo": "error"
+      }
+    },
+    {
+      "files": ["**/*.bench.ts"],
+      "rules": { "vitest/expect-expect": "off" }
+    }
+  ]
 }

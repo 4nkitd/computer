@@ -25,6 +25,7 @@ async function eventually(
     }
     await new Promise((resolve) => setTimeout(resolve, TICK_MS));
   }
+  // oxlint-disable-next-line typescript/only-throw-error -- rethrows a caught value
   if (lastError) throw lastError;
   throw new Error("eventually(): condition never became true");
 }
@@ -169,7 +170,7 @@ test("shim.flush() resolves on an unmounted shim without throwing", async (_ctx)
     await fs.rm(mountPoint, { recursive: true, force: true });
   });
   await shim.unmount();
-  await shim.flush();
+  await expect(shim.flush()).resolves.toBeUndefined();
 });
 
 test("shim.reconcileNow() settles disk writes into the VFS before resolving", async (_ctx) => {
@@ -217,7 +218,7 @@ test("shim.reconcileNow() resolves on an unmounted shim without throwing", async
     await fs.rm(mountPoint, { recursive: true, force: true });
   });
   await shim.unmount();
-  await shim.reconcileNow();
+  await expect(shim.reconcileNow()).resolves.toBeUndefined();
 });
 
 test("shim drops VFS writes outside the mount point", async (_ctx) => {
