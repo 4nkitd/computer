@@ -2,7 +2,9 @@
 //
 // Drives each registered Mount's materialize() exactly once per DO
 // lifetime. Persists progress to _vfs_mounts so a subsequent
-// Workspace over the same store does not re-run. Failures roll back
+// Workspace over the same store does not re-run, unless the mount
+// declares a version that differs from the one recorded there, in
+// which case the subtree is replaced. Failures roll back
 // the subtree under the mount root and leave _vfs_mounts.indexed = 0
 // so the next pass retries from scratch.
 //
@@ -33,18 +35,47 @@ export interface IndexerOptions {
 async function runIndex(opts: IndexerOptions): Promise<void> {
   const { db, fs, mounts } = opts;
   // Snapshot the indexed flag per root so we don't re-run something
-  // a previous attach already finished.
+  // a previous attach already finished. A mount that declares a
+  // version is only finished if the recorded version matches; one
+  // indexed under a different version is stale and gets replaced.
+  // Mounts without a version keep the once-per-store behavior.
+  //
+  // A version may be an async function (a lazily loaded source can only
+  // be hashed by loading it), so resolve every version first. A mount
+  // whose version can't be resolved fails on its own, like a failed
+  // materialize(), without holding up the others.
+  const versions = new Map<string, string | undefined>();
+  const versionFailures: unknown[] = [];
+  const resolved = await Promise.allSettled(
+    [...mounts].map(async ([root, mount]) => {
+      const version = typeof mount.version === "function" ? await mount.version() : mount.version;
+      versions.set(root, version);
+    }),
+  );
+  for (const result of resolved) {
+    if (result.status === "rejected") versionFailures.push(result.reason);
+  }
+
   const status = new Map<string, boolean>();
   for (const root of mounts.keys()) {
-    const row = db.one<{ indexed: number }>("SELECT indexed FROM _vfs_mounts WHERE root = ?", root);
-    status.set(root, row?.indexed === 1);
+    if (!versions.has(root)) continue;
+    const version = versions.get(root);
+    const row = db.one<{ indexed: number; version: string | null }>(
+      "SELECT indexed, version FROM _vfs_mounts WHERE root = ?",
+      root,
+    );
+    const versionMatches = version === undefined || row?.version === version;
+    status.set(root, row?.indexed === 1 && versionMatches);
   }
 
   // Run every pending mount in parallel. Per-mount failures clear
   // their own subtree; the overall index call rejects with the first
   // failure once every pending mount has settled.
-  const pending = [...mounts.entries()].filter(([root]) => status.get(root) !== true);
-  if (pending.length === 0) return;
+  const pending = [...mounts.entries()].filter(([root]) => status.get(root) === false);
+  if (pending.length === 0) {
+    if (versionFailures.length > 0) throw versionFailures[0];
+    return;
+  }
 
   const results = await Promise.allSettled(
     pending.map(async ([root, mount]) => {
@@ -73,7 +104,18 @@ async function runIndex(opts: IndexerOptions): Promise<void> {
         // with ENOENT. The mkdir is inside the try block so a crash
         // mid-materialize rolls it back via the existing fs.rm path
         // below.
-        await fs.mkdir(root, { recursive: true });
+        //
+        // A mount owns its root outright, so whatever is there is
+        // removed first: files from a previous version, files a user
+        // created before the mount was registered, and the partial
+        // output of an interrupted run, whatever state that left the
+        // _vfs_mounts row in. Clearing on every pass is what keeps a
+        // retry from leaving stale files behind. The rm goes through
+        // the filesystem, so it is recorded as changes and reaches the
+        // container on the next push.
+        await clearRoot(fs, root);
+        // "/" always exists, and mkdir rejects it even with recursive.
+        if (root !== "/") await fs.mkdir(root, { recursive: true });
         await mount.materialize(api);
         // Stamp every node reachable from the mount root with
         // mount_root = <root>. The dofs guard reads the path → root
@@ -91,7 +133,7 @@ async function runIndex(opts: IndexerOptions): Promise<void> {
         // row is still mode='read-write' at this point, so the rm
         // is not blocked by its own guard.
         try {
-          await fs.rm(root, { recursive: true, force: true });
+          await clearRoot(fs, root);
         } catch {
           // Best effort. If the subtree doesn't exist we still want
           // the original error to surface.
@@ -102,16 +144,39 @@ async function runIndex(opts: IndexerOptions): Promise<void> {
       // UPDATE, then invalidate the guard cache so subsequent
       // writes through Workspace.fs (and any pull) see the final
       // mode.
-      db.run("UPDATE _vfs_mounts SET mode = ?, indexed = 1 WHERE root = ?", mount.mode, root);
+      db.run(
+        "UPDATE _vfs_mounts SET mode = ?, indexed = 1, version = ? WHERE root = ?",
+        mount.mode,
+        versions.get(root) ?? null,
+        root,
+      );
       invalidateReadOnlyMountCache(db);
     }),
   );
 
-  const failures = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+  const failures = [
+    ...versionFailures,
+    ...results
+      .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+      .map((r) => r.reason),
+  ];
   if (failures.length > 0) {
     // Surface the first failure; preserve the original error so
     // tests / callers see the underlying message.
-    throw failures[0].reason;
+    throw failures[0];
+  }
+}
+
+// Remove everything under a mount root. "/" itself can't be removed
+// (rm rejects it with EPERM), so a mount at the workspace root is
+// cleared one child at a time.
+async function clearRoot(fs: WorkspaceFilesystem, root: string): Promise<void> {
+  if (root !== "/") {
+    await fs.rm(root, { recursive: true, force: true });
+    return;
+  }
+  for (const entry of await fs.readdir("/")) {
+    await fs.rm(`/${entry.name}`, { recursive: true, force: true });
   }
 }
 
@@ -187,8 +252,12 @@ function createWriteAPI(opts: WriteAPIOptions): MountWriteAPI {
   let bytesWritten = 0;
   let entriesWritten = 0;
 
+  // Every path under "/" already starts with "/", so the root itself is
+  // the prefix there rather than "//".
+  const prefix = root === "/" ? "/" : `${root}/`;
+
   function checkPath(absPath: string): void {
-    if (!absPath.startsWith(`${root}/`) && absPath !== root) {
+    if (!absPath.startsWith(prefix) && absPath !== root) {
       throw new Error(`mount ${root}: writeFile/mkdir target ${absPath} is outside the mount root`);
     }
   }

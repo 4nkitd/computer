@@ -122,13 +122,21 @@
     "./observe/cloudflare": {
       "types": "./dist/observe/cloudflare.d.ts",
       "import": "./dist/observe/cloudflare.js"
+    },
+    "./vite": {
+      "types": "./dist/vite/index.d.ts",
+      "import": "./dist/vite/index.js"
+    },
+    "./vite/client": {
+      "types": "./vite-client.d.ts"
     }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "vite-client.d.ts"
   ],
   "scripts": {
     "build:deps": "npm run build --workspace @cloudflare/computer-rpc",
@@ -156,6 +164,7 @@
     "@cloudflare/workers-types": "^4.20260616.1 || ^5.20260921.1",
     "@platformatic/vfs": "*",
     "ai": "^6.0.196 || ^7.0.0",
+    "vite": "^6.0.0 || ^7.0.0 || ^8.0.0",
     "zod": "^4.4.3"
   },
   "peerDependenciesMeta": {
@@ -168,6 +177,9 @@
     "ai": {
       "optional": true
     },
+    "vite": {
+      "optional": true
+    },
     "zod": {
       "optional": true
     }
@@ -175,6 +187,7 @@
   "devDependencies": {
     "@cloudflare/computer-rpc": "*",
     "@cloudflare/dofs": "*",
+    "@cloudflare/vite-plugin": "^1.63.0",
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^4.20260616.1 || ^5.20260921.1",
     "@earendil-works/pi-ai": "^0.99.2",
@@ -188,8 +201,9 @@
     "rolldown": "^1.0.2",
     "rolldown-plugin-dts": "^0.25.2",
     "typescript": "^6.0.3",
+    "vite": "^8.0.16",
     "vitest": "^4.1.11",
-    "wrangler": "^4.137.0",
+    "wrangler": "^4.148.0",
     "zod": "^4.4.3"
   }
 }
