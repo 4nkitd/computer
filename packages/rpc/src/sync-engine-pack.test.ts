@@ -2,6 +2,7 @@ import {
   currentRev,
   Database,
   initializeSchema,
+  readFetchCursor,
   readOperation,
   readPushCursor,
   SQLiteWorkspaceProvider,
@@ -11,6 +12,7 @@ import { describe, expect, it } from "vitest";
 
 import type { SyncRPC } from "./interface.js";
 import { createSyncServer } from "./server.js";
+import { reconcileWatermarks } from "./sync-driver.js";
 import { pullBlocks, pushBlocks, type SyncProgress } from "./sync-engine.js";
 
 // Pack mode is the bulk path. These tests force the mode thresholds
@@ -561,6 +563,38 @@ describe("acknowledging pulled versions", () => {
       }
     });
 
+    // pullBlocks does not check for divergence itself; reconcileWatermarks
+    // does, on connect, by comparing the container's fetch cursor with
+    // ours. An acknowledgment sent to a container that restarted empty
+    // would raise that fetch cursor over files it never received, hiding
+    // the restart for good. It is sent only when the container already
+    // confirms our push cursor.
+    it(`${mode}: an acknowledgment never hides a container that restarted empty`, async () => {
+      const local = makePeer();
+      const before = makePeer();
+      const restarted = makePeer();
+      try {
+        const host = new SQLiteWorkspaceProvider(local.db);
+        host.writeFileSync("/x", "host file");
+        await drain(pushBlocks(local.db, before.rpc, options));
+
+        const container = new SQLiteWorkspaceProvider(restarted.db);
+        container.writeFileSync("/y", "made after the restart");
+        await drain(pullBlocks(local.db, restarted.rpc, options));
+        expect(readFetchCursor(restarted.db)).toEqual({ rev: 0, path: null });
+
+        expect((await reconcileWatermarks(local.db, restarted.rpc, "linux")).pushRevReset).toBe(
+          true,
+        );
+        await drain(pushBlocks(local.db, restarted.rpc, options));
+        expect(names(restarted.db)).toEqual(["x", "y"]);
+      } finally {
+        local.close();
+        before.close();
+        restarted.close();
+      }
+    });
+
     it(`${mode}: unpushed host work blocks the acknowledgment and still ships`, async () => {
       const local = makePeer();
       const remote = makePeer();
@@ -581,10 +615,10 @@ describe("acknowledging pulled versions", () => {
     });
 
     // Without the acknowledgment the pulled copy looks like unpushed
-    // host work, so the delete is kept and the next push recreates the
-    // file in the container. Deletes carrying the deleted version's
-    // fingerprint close this; until then it is the conservative path.
-    it(`${mode}: without an acknowledgment a pulled file survives its remote delete`, async () => {
+    // host work. The container's tombstone carries the fingerprint of
+    // the version it removed, which is exactly what the host holds, so
+    // the delete applies anyway and nothing comes back on the next push.
+    it(`${mode}: a fingerprinted delete removes a pulled file the pull could not acknowledge`, async () => {
       const local = makePeer();
       const remote = makePeer();
       try {
@@ -595,10 +629,10 @@ describe("acknowledging pulled versions", () => {
         await drain(pullBlocks(local.db, remote.rpc, options));
         container.unlinkSync("/x");
         await drain(pullBlocks(local.db, remote.rpc, options));
-        expect(names(local.db)).toEqual(["local", "x"]);
+        expect(names(local.db)).toEqual(["local"]);
 
         await drain(pushBlocks(local.db, remote.rpc, options));
-        expect(names(remote.db)).toEqual(["local", "x"]);
+        expect(names(remote.db)).toEqual(["local"]);
       } finally {
         local.close();
         remote.close();
