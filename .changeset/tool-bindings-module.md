@@ -1,5 +1,5 @@
 ---
-"@cloudflare/computer": minor
+"@cloudflare/computer": patch
 ---
 
-Isolate JavaScript can call an agent's own tools through `ws:tools`. `createToolBindings()` from `@cloudflare/computer/modules/tools` builds the module from tool bindings, and `forPiTools()` from `@cloudflare/computer/tools/pi-ai` makes those bindings from pi tools or from `createPiTools()`. On a read-only backend, only tools marked `readOnly` run.
+Add `ws:tools` to provide the JavaScript worker backend programmatic access to tools; see [`ws:tools` documentation](https://github.com/cloudflare/computer/blob/main/docs/17_isolate_javascript.md#wstools).

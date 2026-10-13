@@ -1,7 +1,5 @@
 ---
-"@cloudflare/computer": minor
+"@cloudflare/computer": patch
 ---
 
-`forAISDKTools()` from `@cloudflare/computer/tools/ai-sdk` serves an AI SDK tool set to isolate JavaScript as `ws:tools`, through `createToolBindings()`. Each call is checked against the tool's `inputSchema` before it runs, and a `{ error: string }` result comes back with `isError: true`. Tools that run in the browser or need approval are left out, and a function of tools is read on every call, so an agent can change its tools between turns.
-
-`createToolBindings()` now normalizes a tool name that cannot be a JavaScript export instead of failing the connection: separators become `_` and other characters an identifier cannot hold are dropped, so `list-files` is exported as `list_files`.
+Add `forAISDKTools()` in `@cloudflare/computer/tools/ai-sdk` to serve an AI SDK tool set to isolate JavaScript as `ws:tools`; see [`ws:tools` documentation](https://github.com/cloudflare/computer/blob/main/docs/17_isolate_javascript.md#wstools).
