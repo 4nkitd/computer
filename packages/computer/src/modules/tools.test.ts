@@ -93,6 +93,17 @@ describe("createToolBindings", () => {
     expect(write.calls).toEqual([]);
   });
 
+  it("does not run a tool whose call was cancelled before it started", async () => {
+    const write = recording("write");
+    const functions = createToolBindings([write.binding])(host);
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled"));
+    await expect(
+      functions.write?.([{ path: "a.txt" }], callContext({ signal: controller.signal })),
+    ).rejects.toThrow("cancelled");
+    expect(write.calls).toEqual([]);
+  });
+
   it("runs a tool marked readOnly on a read-only backend", async () => {
     const read = recording("read", { readOnly: true });
     const functions = createToolBindings([read.binding])(host);
@@ -168,5 +179,44 @@ describe("createToolBindings", () => {
       "The agent's own tools, callable from code. Each is exported under its name made into an identifier: `-`, `.`, and spaces become `_`, and other characters an identifier cannot hold are dropped, so `list-files` becomes `list_files`. Each takes one object of the tool's arguments and returns `{ text, details, isError }`.",
     );
     expect(createToolBindings([], { description: "Custom." }).description).toBe("Custom.");
+  });
+
+  it("lists the tools code can import under their export names", () => {
+    const description = createToolBindings([
+      recording("read").binding,
+      recording("list-files").binding,
+      recording("exec").binding,
+    ]).description;
+
+    expect(description).toContain("It exports `read`, `list_files`.");
+    expect(description).toContain("There is no `exec` export");
+  });
+
+  it("lists a function's tools as they are when the backend describes itself", () => {
+    let names = ["read"];
+    const factory = createToolBindings(() => names.map((name) => recording(name).binding));
+
+    expect(factory.description).toContain("It exports `read`.");
+    names = ["read", "grep"];
+    expect(factory.description).toContain("It exports `read`, `grep`.");
+  });
+
+  it("does not read a single-use iterable to describe it", () => {
+    function* tools() {
+      yield recording("read").binding;
+    }
+    const factory = createToolBindings(tools());
+
+    expect(factory.description).not.toContain("It exports");
+    expect(Object.keys(factory(host))).toEqual(["read"]);
+  });
+
+  it("leaves the list out when the function of tools throws", () => {
+    const factory = createToolBindings(() => {
+      throw new Error("not ready");
+    });
+
+    expect(factory.description).toContain("The agent's own tools, callable from code.");
+    expect(factory.description).not.toContain("It exports");
   });
 });

@@ -13,6 +13,11 @@
 // pending Workspace writes before the command and pulls the
 // container's changes after it.
 
+import {
+  DEFAULT_OUTPUT_MAX_LINES,
+  type OutputLimits,
+  OutputWindow,
+} from "../runtime/output-tail.js";
 import type {
   WorkspaceModuleCallContext,
   WorkspaceModuleFactory,
@@ -42,6 +47,12 @@ export interface ContainerModuleOptions {
    * under the backend's `maxCapabilityBytes`.
    */
   readonly maxOutputBytes?: number;
+  /**
+   * Most lines of each stream returned to the isolate. Defaults to the
+   * runtime's 2000.
+   */
+  readonly maxOutputLines?: number;
+  readonly prelude?: string;
 }
 
 /**
@@ -75,6 +86,24 @@ export function createContainerModule(
   if (!Number.isInteger(maxOutputBytes) || maxOutputBytes <= 0) {
     throw new Error("createContainerModule: maxOutputBytes must be a positive integer.");
   }
+  const maxOutputLines = options.maxOutputLines;
+  if (maxOutputLines !== undefined && (!Number.isInteger(maxOutputLines) || maxOutputLines <= 0)) {
+    throw new Error("createContainerModule: maxOutputLines must be a positive integer.");
+  }
+  const output =
+    maxOutputLines === undefined
+      ? { maxBytes: maxOutputBytes }
+      : { maxBytes: maxOutputBytes, maxLines: maxOutputLines };
+  const limits: OutputLimits = {
+    maxBytes: maxOutputBytes,
+    maxLines: maxOutputLines ?? DEFAULT_OUTPUT_MAX_LINES,
+  };
+  const prelude = options.prelude;
+  if (prelude !== undefined && typeof prelude !== "string") {
+    throw new Error("createContainerModule: prelude must be a string.");
+  }
+  const withPrelude = (command: string) =>
+    prelude === undefined || prelude.trim() === "" ? command : `${prelude}\n${command}`;
 
   const create = (host: WorkspaceModuleHost): WorkspaceModuleFunctions => {
     // The factory runs when the JavaScript backend connects, so a
@@ -105,14 +134,14 @@ export function createContainerModule(
       const timeoutMs = remainingTime(request.timeoutMs, context);
       context.signal.throwIfAborted();
 
-      const handle = await host.runtime.exec(request.command, {
+      const handle = await host.runtime.exec(withPrelude(request.command), {
         backend,
         encoding: "utf8",
         timeoutMs,
         // The runtime keeps only the end of long output in memory and
         // saves the rest to a file, so a noisy command cannot exhaust
         // the Durable Object.
-        output: { maxBytes: maxOutputBytes },
+        output,
         ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
         ...(request.env === undefined ? {} : { env: request.env }),
         ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
@@ -125,16 +154,17 @@ export function createContainerModule(
       try {
         const result = await handle.result();
         // A Workspace with `output: false` returns everything, so cut
-        // here too; the runtime already cut a stream it reports.
+        // here too, to the same limits; the runtime already cut a
+        // stream it reports.
         return {
           exitCode: result.exitCode,
           stdout:
             result.truncated?.stdout === undefined
-              ? truncateText(result.stdout, maxOutputBytes)
+              ? keepTail(result.stdout, limits)
               : result.stdout,
           stderr:
             result.truncated?.stderr === undefined
-              ? truncateText(result.stderr, maxOutputBytes)
+              ? keepTail(result.stderr, limits)
               : result.stderr,
           ...(result.truncated === undefined ? {} : { truncated: { ...result.truncated } }),
           sync: syncSummary(result.sync),
@@ -153,6 +183,23 @@ const DESCRIPTION = [
   "Output comes back when the command finishes. Long output keeps its last lines; `truncated.stdout.path` (or `truncated.stderr.path`) then names a workspace file holding all of it. The file usually sits outside this code's `node:fs` root, so return the path and open it with the agent's read or grep tools. A non-zero `exitCode` is returned, not thrown.",
   "`sync.status` is `pending` if the container's file changes have not reached the workspace yet. The container's changes win over files written meanwhile, so do not write files the command also writes while it runs.",
 ].join(" ");
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+// The end of a stream the runtime did not cut, as the runtime would
+// have cut it, with a note in front saying what is shown. There is no
+// file holding the rest to point to.
+function keepTail(value: string, limits: OutputLimits): string {
+  const window = new OutputWindow(limits);
+  window.push(encoder.encode(value));
+  const kept = window.read();
+  if (kept._tag === "whole") return value;
+  const shown = kept.partialLine
+    ? `the last ${kept.bytes.length} bytes of line ${kept.lastLine}`
+    : `lines ${kept.firstLine}-${kept.lastLine} of ${window.totalLines}`;
+  return `[truncated, showing ${shown}]\n\n${decoder.decode(kept.bytes)}`;
+}
 
 // How the container's file changes came back to the Workspace. A
 // "pending" status means they did not, yet; `skipped` lists paths the
