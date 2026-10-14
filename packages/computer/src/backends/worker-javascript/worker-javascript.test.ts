@@ -1241,6 +1241,62 @@ describe("WorkerJavaScriptBackend", () => {
     await workspace.close();
   });
 
+  describe("CPU limit", () => {
+    function recordingLoader() {
+      return vi.fn<WorkspaceRuntimeLoader["load"]>(() => ({
+        getEntrypoint() {
+          return {
+            evaluate: (
+              _input: unknown,
+              host: {
+                assertResult(value: unknown): Promise<void>;
+                attachOutput(readable: ReadableStream<Uint8Array>): Promise<void>;
+              },
+            ) => evaluateResult(host, null),
+          };
+        },
+      }));
+    }
+
+    it("defaults the CPU limit to the execution timeout", async () => {
+      const load = recordingLoader();
+      const workspace = new Workspace({
+        storage: new SQLiteTestStorage(),
+        backends: [new WorkerJavaScriptBackend({ loader: { load } })],
+      });
+      await workspace.fs.mkdir("/workspace", { recursive: true });
+      await (await workspace.runtime.exec("export default null", { timeoutMs: 45_000 })).result();
+      expect(load.mock.calls[0]?.[0]).toMatchObject({ limits: { cpuMs: 45_000 } });
+      await workspace.close();
+    });
+
+    it("caps the CPU limit at maxCpuMs without shortening the timeout", async () => {
+      const load = recordingLoader();
+      const workspace = new Workspace({
+        storage: new SQLiteTestStorage(),
+        backends: [
+          new WorkerJavaScriptBackend({
+            loader: { load },
+            maxTimeoutMs: 60 * 60_000,
+            maxCpuMs: 300_000,
+          }),
+        ],
+      });
+      await workspace.fs.mkdir("/workspace", { recursive: true });
+      await (
+        await workspace.runtime.exec("export default null", { timeoutMs: 30 * 60_000 })
+      ).result();
+      expect(load.mock.calls[0]?.[0]).toMatchObject({ limits: { cpuMs: 300_000 } });
+      await workspace.close();
+    });
+
+    it("rejects a maxCpuMs that is not positive and finite", () => {
+      expect(
+        () => new WorkerJavaScriptBackend({ loader: throwingLoader("unused"), maxCpuMs: 0 }),
+      ).toThrow(/maxCpuMs/);
+    });
+  });
+
   it("rejects relative imports that collide with internal Loader modules", async () => {
     const load = vi.fn<WorkspaceRuntimeLoader["load"]>();
     const workspace = new Workspace({

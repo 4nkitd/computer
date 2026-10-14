@@ -54,6 +54,17 @@ export interface WorkerJavaScriptBackendOptions {
   modules?: Record<string, WorkspaceModule>;
   defaultTimeoutMs?: number;
   maxTimeoutMs?: number;
+  /**
+   * The most CPU time one execution can use, in milliseconds. Each
+   * execution's CPU limit is the smaller of its timeout and this value.
+   * Defaults to `maxTimeoutMs`, which makes the CPU limit the timeout.
+   *
+   * CPU time adds up over the whole execution, however much of it is spent
+   * waiting. Cloudflare currently stops a Dynamic Worker call at about five
+   * minutes of CPU whatever the limit, so values above 300000 have no
+   * effect.
+   */
+  maxCpuMs?: number;
   maxSourceBytes?: number;
   maxInputBytes?: number;
   maxStdinBytes?: number;
@@ -88,6 +99,7 @@ type ResolvedWorkerJavaScriptBackendOptions = Required<
     | "access"
     | "defaultTimeoutMs"
     | "maxTimeoutMs"
+    | "maxCpuMs"
     | "maxSourceBytes"
     | "maxInputBytes"
     | "maxStdinBytes"
@@ -170,6 +182,8 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
     const defaultTimeoutMs = options.defaultTimeoutMs ?? Math.min(60_000, maxTimeoutMs);
     assertPositiveFinite(maxTimeoutMs, "maxTimeoutMs");
     assertPositiveFinite(defaultTimeoutMs, "defaultTimeoutMs");
+    const maxCpuMs = options.maxCpuMs ?? maxTimeoutMs;
+    assertPositiveFinite(maxCpuMs, "maxCpuMs");
     assertPositiveFinite(options.maxSourceBytes ?? 1024 * 1024, "maxSourceBytes");
     assertPositiveFinite(options.maxInputBytes ?? 1024 * 1024, "maxInputBytes");
     assertPositiveFinite(options.maxStdinBytes ?? 256 * 1024, "maxStdinBytes");
@@ -221,6 +235,7 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
       access: options.access ?? "read-write",
       defaultTimeoutMs,
       maxTimeoutMs,
+      maxCpuMs,
       maxSourceBytes: options.maxSourceBytes ?? 1024 * 1024,
       maxInputBytes: options.maxInputBytes ?? 1024 * 1024,
       maxStdinBytes: options.maxStdinBytes ?? 256 * 1024,
@@ -478,6 +493,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
           },
           bridge,
           timeoutMs,
+          cpuMs: Math.min(timeoutMs, this.#options.maxCpuMs),
           egress: this.#options.egress,
           compatibilityDate: this.#options.compatibilityDate,
           compatibilityFlags: this.#options.compatibilityFlags,
@@ -988,6 +1004,7 @@ function startJavaScriptExecution(options: {
   context: WorkspaceExecutionContext;
   bridge: WorkspaceRuntimeBridge;
   timeoutMs: number;
+  cpuMs: number;
   egress: WorkspaceEgressPolicy;
   compatibilityDate: string;
   compatibilityFlags: string[];
@@ -1004,7 +1021,7 @@ function startJavaScriptExecution(options: {
   const worker = options.loader.load({
     compatibilityDate: options.compatibilityDate,
     compatibilityFlags: options.compatibilityFlags,
-    limits: { cpuMs: options.timeoutMs },
+    limits: { cpuMs: options.cpuMs },
     mainModule: "workspace-runtime-runner.js",
     modules,
     ...dynamicWorkerEgress(options.egress),
@@ -1012,7 +1029,7 @@ function startJavaScriptExecution(options: {
   let entrypoint: JavaScriptEntrypoint;
   try {
     entrypoint = worker.getEntrypoint(undefined, {
-      limits: { cpuMs: options.timeoutMs },
+      limits: { cpuMs: options.cpuMs },
     }) as JavaScriptEntrypoint;
   } catch (error) {
     disposeQuietly(worker as { [Symbol.dispose]?: () => void });
