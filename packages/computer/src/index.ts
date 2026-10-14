@@ -100,6 +100,7 @@ export type {
   WorkspaceRuntimeExecHandle,
   WorkspaceRuntimeExecOptions,
   WorkspaceRuntimeGetOptions,
+  WorkspaceRuntimeInterruptPolicy,
   WorkspaceRuntimeKillOptions,
   WorkspaceRuntimeLoader,
   WorkspaceRuntimeOutputOptions,
