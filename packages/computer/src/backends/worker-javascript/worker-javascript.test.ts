@@ -1411,6 +1411,43 @@ describe("WorkerJavaScriptBackend", () => {
       return setIntervalSpy.mock.results[call]?.value;
     }
 
+    it("clears the timer when the last execution is killed", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const { workspace, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1", { id: "killed" });
+        await vi.waitFor(() => expect(started()).toBe(1));
+        const timer = keepAliveTimer(setIntervalSpy);
+        await workspace.runtime.killExec("killed");
+        await expect(handle.result()).resolves.toMatchObject({ status: "cancelled" });
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
+    it("clears the timer when the Workspace closes with executions running", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const { workspace, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        await workspace.runtime.exec("export default 1");
+        await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(2));
+        const timer = keepAliveTimer(setIntervalSpy);
+        await workspace.close();
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+      } finally {
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
     it("schedules no timer when the host's pending work can't keep the object in memory", async () => {
       vi.stubGlobal("Cloudflare", {
         compatibilityFlags: { durable_object_io_tasks_prevent_eviction: false },
