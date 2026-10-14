@@ -112,21 +112,31 @@ Host calls have a caller-visible deadline, controlled by `maxHostCallMs` and def
 
 ## Long-running executions
 
-An execution runs until its code returns or its timeout passes, and `maxTimeoutMs` caps the timeout at 3 minutes by default. To allow longer runs, raise it along with `maxCapabilityCalls`, which counts every filesystem and host module call a run makes and defaults to 256:
+An execution runs until its code returns or its timeout passes, and `maxTimeoutMs` caps the timeout at 3 minutes by default. Several other limits apply to the whole execution, so a long run reaches them sooner:
+
+| Option | Default | Counts |
+|---|---|---|
+| `maxCapabilityCalls` | 256 | every filesystem and host module call |
+| `maxCapabilityRequestBytes` | 8 MiB | bytes sent to those calls, in total |
+| `maxCapabilityResponseBytes` | 8 MiB | bytes returned by those calls, in total |
+| `maxStdioBytes` | 1 MiB | standard output and standard error, in total; output past it is dropped |
+
+Raise the ones a long run needs along with the timeout:
 
 ```ts
 new WorkerJavaScriptBackend({
   loader: env.LOADER,
   maxTimeoutMs: 2 * 60 * 60_000,
   maxCapabilityCalls: 100_000,
+  maxCapabilityResponseBytes: 256 * 1024 * 1024,
 });
 ```
 
 `maxHostCallMs` defaults to `maxTimeoutMs`, so it grows with it.
 
-A run also needs its Durable Object to stay in memory, and that depends on the host Worker's compatibility date. From 2026-10-01, each piece of pending work keeps a Durable Object in memory for up to 15 minutes from when it starts. A run that keeps making host calls or printing output keeps renewing that, but a quiet one, such as a run waiting on one slow `fetch`, would be evicted 15 minutes after it started. To cover that case, the backend schedules a timer every `keepAliveIntervalMs` (60 seconds by default) while any run is in flight, and each timer counts as new pending work. On earlier compatibility dates, pending work and timers don't keep a Durable Object in memory, and a run that outlives the request that started it is evicted about a minute after that request ends, unless the request awaits the run or the host keeps the object in memory itself, for example with an alarm.
+A run also needs its Durable Object to stay in memory, and that depends on the host Worker's compatibility date. From 2026-10-01, each piece of pending work keeps a Durable Object in memory for up to 15 minutes from when it starts. A run that keeps making host calls or printing output keeps renewing that, but a quiet one, such as a run waiting on one slow `fetch`, would be evicted 15 minutes after it started. To cover that case, the backend schedules a timer every `keepAliveIntervalMs` (60 seconds by default) while any run is in flight, and each timer counts as new pending work. A run stops counting once its timeout plus `maxHostCallMs` has passed, even if it is still waiting for a host call to settle. While the timer runs, the object is billed for duration and can't hibernate. On earlier compatibility dates, pending work and timers don't keep a Durable Object in memory, and a run that outlives the request that started it is evicted about a minute after that request ends, unless the request awaits the run or the host keeps the object in memory itself, for example with an alarm.
 
-CPU time is limited separately from wall-clock time. Each run's CPU limit is the smaller of its timeout and `maxCpuMs`, which defaults to `maxTimeoutMs`. CPU time adds up over the whole run, however much of it is spent waiting, and Cloudflare currently stops a Dynamic Worker call at about five minutes of CPU whatever the limit. A run that mostly waits on I/O uses little of that and can last hours. A run that computes heavily fails with `Worker exceeded CPU time limit.` once it reaches the cap. Every execution gets a fresh Dynamic Worker and a fresh CPU budget, so heavy work can be split across executions or moved to a container.
+CPU time is limited separately from wall-clock time. Each run's CPU limit is the smaller of its timeout and `maxCpuMs`, which defaults to `maxTimeoutMs`. CPU time adds up over the whole run, however much of it is spent waiting, and Cloudflare currently stops a Dynamic Worker call at about five minutes of CPU whatever the limit. A run that mostly waits on I/O uses little of that and can last hours. A run that computes heavily fails with `Worker exceeded CPU time limit.` once it reaches the cap. Every execution gets a fresh Dynamic Worker and a fresh CPU budget, so heavy work can be split across executions or moved to a container. The platform's subrequest limit, 10,000 by default on the Workers Paid plan, also counts every `fetch` over the whole run. A long run also holds one of the ten Dynamic Workers a Durable Object can have in flight for as long as it lasts.
 
 Nothing keeps a run going across a deploy or a crash. A deploy shuts the old instance down a few minutes later, and a run that was in flight is marked as failed the next time the backend connects.
 
