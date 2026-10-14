@@ -1402,6 +1402,55 @@ describe("WorkerJavaScriptBackend", () => {
       }
     });
 
+    // The timer's id from the one setInterval call the keep-alive makes.
+    function keepAliveTimer(setIntervalSpy: {
+      mock: { calls: unknown[][]; results: { value: unknown }[] };
+    }) {
+      const call = setIntervalSpy.mock.calls.findIndex(([, ms]) => ms === 60_000);
+      expect(call).not.toBe(-1);
+      return setIntervalSpy.mock.results[call]?.value;
+    }
+
+    it("schedules no timer when the host's pending work can't keep the object in memory", async () => {
+      vi.stubGlobal("Cloudflare", {
+        compatibilityFlags: { durable_object_io_tasks_prevent_eviction: false },
+      });
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(1));
+        expect(setIntervalSpy.mock.calls.filter(([, ms]) => ms === 60_000)).toHaveLength(0);
+        release();
+        await handle.result();
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("schedules the timer when the host's pending work keeps the object in memory", async () => {
+      vi.stubGlobal("Cloudflare", {
+        compatibilityFlags: { durable_object_io_tasks_prevent_eviction: true },
+      });
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(1));
+        keepAliveTimer(setIntervalSpy);
+        release();
+        await handle.result();
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
     it("rejects a keepAliveIntervalMs that is negative, non-finite, or 15 minutes or more", () => {
       for (const keepAliveIntervalMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, 900_000]) {
         expect(

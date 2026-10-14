@@ -81,6 +81,10 @@ export interface WorkerJavaScriptBackendOptions {
    * memory for as long as an execution is running. The interval must be
    * under 15 minutes.
    *
+   * The backend reads the host Worker's compatibility flags and schedules
+   * the timer only where it helps, from 2026-10-01 or with
+   * `durable_object_io_tasks_prevent_eviction`.
+   *
    * An execution stops counting once its timeout plus `maxHostCallMs` has
    * passed, even if it is still waiting for a host call to settle, so a
    * host module that never settles can't keep the object in memory
@@ -88,9 +92,10 @@ export interface WorkerJavaScriptBackendOptions {
    * and can't hibernate.
    *
    * On earlier compatibility dates, pending work and timers do not keep a
-   * Durable Object in memory, and an execution that outlives the request
-   * that started it is evicted after about a minute. A host on an earlier
-   * date needs its own keep-alive, such as an alarm.
+   * Durable Object in memory, so no timer is scheduled, and an execution
+   * that outlives the request that started it is evicted after about a
+   * minute. A host on an earlier date needs its own keep-alive, such as an
+   * alarm.
    */
   keepAliveIntervalMs?: number;
   maxSourceBytes?: number;
@@ -337,9 +342,12 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   // towards the keep-alive.
   readonly #running = new Map<string, number>();
   #keepAlive: ReturnType<typeof setInterval> | undefined;
+  // Zero when the timer is off or can't keep this object in memory.
+  readonly #keepAliveIntervalMs: number;
 
   constructor(options: ResolvedWorkerJavaScriptBackendOptions, host: WorkspaceModuleBackendHost) {
     this.#options = options;
+    this.#keepAliveIntervalMs = hostKeepsPendingWork() ? options.keepAliveIntervalMs : 0;
     this.#host = host;
     const functions = new Map<string, WorkspaceModuleFunctions>();
     const empty = new Set<string>();
@@ -645,11 +653,8 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   // the timer is what counts as pending work; when it fires it only drops
   // executions past their keep-alive deadline. See `keepAliveIntervalMs`.
   #syncKeepAlive() {
-    if (this.#running.size > 0 && this.#options.keepAliveIntervalMs > 0) {
-      this.#keepAlive ??= setInterval(
-        () => this.#expireKeepAlive(),
-        this.#options.keepAliveIntervalMs,
-      );
+    if (this.#running.size > 0 && this.#keepAliveIntervalMs > 0) {
+      this.#keepAlive ??= setInterval(() => this.#expireKeepAlive(), this.#keepAliveIntervalMs);
     } else if (this.#keepAlive !== undefined) {
       clearInterval(this.#keepAlive);
       this.#keepAlive = undefined;
@@ -1056,6 +1061,19 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
       }
     });
   }
+}
+
+// Whether pending work keeps this Durable Object in memory, which the host
+// Worker's compatibility date decides: from 2026-10-01 it does, before it
+// doesn't, and a keep-alive timer would do nothing. The Dynamic Worker's
+// own compatibility date plays no part. Outside the Workers runtime the
+// flags aren't there to read, and the timer is scheduled, which is
+// harmless.
+function hostKeepsPendingWork(): boolean {
+  const flags = (
+    globalThis as { Cloudflare?: { compatibilityFlags?: Record<string, boolean | undefined> } }
+  ).Cloudflare?.compatibilityFlags;
+  return flags?.durable_object_io_tasks_prevent_eviction ?? true;
 }
 
 function encodeEvent(event: WorkspaceRuntimeEvent): Uint8Array {
