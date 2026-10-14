@@ -78,7 +78,7 @@ export interface WorkerJavaScriptBackendOptions {
    * output also keep the object in memory while they keep coming, but an
    * execution can't be relied on to make them. Every timer counts as new
    * pending work, so a timer that keeps rescheduling holds the object in
-   * memory for as long as an execution is running. Keep the interval well
+   * memory for as long as an execution is running. The interval must be
    * under 15 minutes.
    *
    * An execution stops counting once its timeout plus `maxHostCallMs` has
@@ -214,9 +214,15 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
     const maxCpuMs = options.maxCpuMs ?? maxTimeoutMs;
     assertPositiveFinite(maxCpuMs, "maxCpuMs");
     const keepAliveIntervalMs = options.keepAliveIntervalMs ?? 60_000;
-    if (!Number.isFinite(keepAliveIntervalMs) || keepAliveIntervalMs < 0) {
+    // Pending work protects a Durable Object for at most 15 minutes, so a
+    // longer interval would leave gaps.
+    if (
+      !Number.isFinite(keepAliveIntervalMs) ||
+      keepAliveIntervalMs < 0 ||
+      keepAliveIntervalMs >= 900_000
+    ) {
       throw new Error(
-        "WorkerJavaScriptBackend keepAliveIntervalMs must be zero or a positive finite number.",
+        "WorkerJavaScriptBackend keepAliveIntervalMs must be zero or less than 15 minutes.",
       );
     }
     assertPositiveFinite(options.maxSourceBytes ?? 1024 * 1024, "maxSourceBytes");

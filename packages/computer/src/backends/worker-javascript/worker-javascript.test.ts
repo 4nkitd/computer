@@ -1402,8 +1402,8 @@ describe("WorkerJavaScriptBackend", () => {
       }
     });
 
-    it("rejects a negative or non-finite keepAliveIntervalMs", () => {
-      for (const keepAliveIntervalMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    it("rejects a keepAliveIntervalMs that is negative, non-finite, or 15 minutes or more", () => {
+      for (const keepAliveIntervalMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, 900_000]) {
         expect(
           () =>
             new WorkerJavaScriptBackend({ loader: throwingLoader("unused"), keepAliveIntervalMs }),
