@@ -65,6 +65,28 @@ export interface WorkerJavaScriptBackendOptions {
    * effect.
    */
   maxCpuMs?: number;
+  /**
+   * How often to schedule a timer while any execution is running, in
+   * milliseconds. Set it to 0 to turn the timer off. Defaults to 60
+   * seconds.
+   *
+   * From compatibility date 2026-10-01, each piece of pending work keeps
+   * a Durable Object in memory for at most 15 minutes from when it starts.
+   * An execution is one call into a Dynamic Worker, so one that goes
+   * quiet, making no host calls and printing nothing, is evicted about 15
+   * minutes after it starts, and the eviction ends it. Host calls and
+   * output also keep the object in memory while they keep coming, but an
+   * execution can't be relied on to make them. Every timer counts as new
+   * pending work, so a timer that keeps rescheduling holds the object in
+   * memory for as long as an execution is running. Keep the interval well
+   * under 15 minutes.
+   *
+   * On earlier compatibility dates, pending work and timers do not keep a
+   * Durable Object in memory, and an execution that outlives the request
+   * that started it is evicted after about a minute. A host on an earlier
+   * date needs its own keep-alive, such as an alarm.
+   */
+  keepAliveIntervalMs?: number;
   maxSourceBytes?: number;
   maxInputBytes?: number;
   maxStdinBytes?: number;
@@ -100,6 +122,7 @@ type ResolvedWorkerJavaScriptBackendOptions = Required<
     | "defaultTimeoutMs"
     | "maxTimeoutMs"
     | "maxCpuMs"
+    | "keepAliveIntervalMs"
     | "maxSourceBytes"
     | "maxInputBytes"
     | "maxStdinBytes"
@@ -184,6 +207,12 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
     assertPositiveFinite(defaultTimeoutMs, "defaultTimeoutMs");
     const maxCpuMs = options.maxCpuMs ?? maxTimeoutMs;
     assertPositiveFinite(maxCpuMs, "maxCpuMs");
+    const keepAliveIntervalMs = options.keepAliveIntervalMs ?? 60_000;
+    if (!Number.isFinite(keepAliveIntervalMs) || keepAliveIntervalMs < 0) {
+      throw new Error(
+        "WorkerJavaScriptBackend keepAliveIntervalMs must be zero or a positive finite number.",
+      );
+    }
     assertPositiveFinite(options.maxSourceBytes ?? 1024 * 1024, "maxSourceBytes");
     assertPositiveFinite(options.maxInputBytes ?? 1024 * 1024, "maxInputBytes");
     assertPositiveFinite(options.maxStdinBytes ?? 256 * 1024, "maxStdinBytes");
@@ -236,6 +265,7 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
       defaultTimeoutMs,
       maxTimeoutMs,
       maxCpuMs,
+      keepAliveIntervalMs,
       maxSourceBytes: options.maxSourceBytes ?? 1024 * 1024,
       maxInputBytes: options.maxInputBytes ?? 1024 * 1024,
       maxStdinBytes: options.maxStdinBytes ?? 256 * 1024,
@@ -291,6 +321,8 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   readonly #activeStreams = new Map<string, number>();
   #pendingStarts = 0;
   readonly #pendingStartWaiters = new Set<() => void>();
+  readonly #running = new Set<string>();
+  #keepAlive: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: ResolvedWorkerJavaScriptBackendOptions, host: WorkspaceModuleBackendHost) {
     this.#options = options;
@@ -468,6 +500,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
         throw error;
       }
       this.#records.set(id, record);
+      this.#markRunning(id);
       try {
         const bridge = new WorkspaceRuntimeBridge(capability, {
           hostModules: this.#hostModuleFunctions,
@@ -575,6 +608,30 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     await Promise.allSettled(finalizations);
     for (const record of records) this.#close(record);
     this.#records.clear();
+    this.#running.clear();
+    this.#syncKeepAlive();
+  }
+
+  #markRunning(id: string) {
+    this.#running.add(id);
+    this.#syncKeepAlive();
+  }
+
+  #markSettled(id: string) {
+    this.#running.delete(id);
+    this.#syncKeepAlive();
+  }
+
+  // Hold the Durable Object in memory while any execution runs. The
+  // timer does nothing when it fires: scheduling it is what counts as
+  // pending work. See `keepAliveIntervalMs`.
+  #syncKeepAlive() {
+    if (this.#running.size > 0 && this.#options.keepAliveIntervalMs > 0) {
+      this.#keepAlive ??= setInterval(() => {}, this.#options.keepAliveIntervalMs);
+    } else if (this.#keepAlive !== undefined) {
+      clearInterval(this.#keepAlive);
+      this.#keepAlive = undefined;
+    }
   }
 
   get #backendId(): string {
@@ -866,6 +923,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     }
     record.status = settledStatus;
     record.events.push(...settledEvents);
+    this.#markSettled(record.id);
     for (const subscriber of [...record.subscribers]) this.#pump(record, subscriber);
     this.#close(record);
     if (!record.persistenceFailed) {

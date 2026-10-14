@@ -1241,6 +1241,97 @@ describe("WorkerJavaScriptBackend", () => {
     await workspace.close();
   });
 
+  describe("keep-alive", () => {
+    function gatedWorkspace(options: { keepAliveIntervalMs?: number } = {}) {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let started = 0;
+      const workspace = new Workspace({
+        storage: new SQLiteTestStorage(),
+        backends: [
+          new WorkerJavaScriptBackend({
+            ...options,
+            loader: {
+              load() {
+                return {
+                  getEntrypoint() {
+                    return {
+                      evaluate: (
+                        _input: unknown,
+                        host: {
+                          assertResult(value: unknown): Promise<void>;
+                          attachOutput(readable: ReadableStream<Uint8Array>): Promise<void>;
+                        },
+                      ) => {
+                        started += 1;
+                        return released.then(() => evaluateResult(host, 1));
+                      },
+                    };
+                  },
+                };
+              },
+            },
+          }),
+        ],
+      });
+      return { workspace, release, started: () => started };
+    }
+
+    it("keeps a timer scheduled while an execution runs and clears it once none do", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const first = await workspace.runtime.exec("export default 1", { id: "first" });
+        const second = await workspace.runtime.exec("export default 1", { id: "second" });
+        await vi.waitFor(() => expect(started()).toBe(2));
+
+        const keepAliveCalls = setIntervalSpy.mock.calls.filter(([, ms]) => ms === 60_000);
+        expect(keepAliveCalls).toHaveLength(1);
+        const timer =
+          setIntervalSpy.mock.results[setIntervalSpy.mock.calls.indexOf(keepAliveCalls[0])]?.value;
+        expect(clearIntervalSpy).not.toHaveBeenCalledWith(timer);
+
+        release();
+        await first.result();
+        await second.result();
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
+    it("schedules no timer when keepAliveIntervalMs is 0", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace({ keepAliveIntervalMs: 0 });
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(1));
+        expect(setIntervalSpy).not.toHaveBeenCalled();
+        release();
+        await handle.result();
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+      }
+    });
+
+    it("rejects a negative or non-finite keepAliveIntervalMs", () => {
+      for (const keepAliveIntervalMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(
+          () =>
+            new WorkerJavaScriptBackend({ loader: throwingLoader("unused"), keepAliveIntervalMs }),
+        ).toThrow(/keepAliveIntervalMs/);
+      }
+    });
+  });
+
   describe("CPU limit", () => {
     function recordingLoader() {
       return vi.fn<WorkspaceRuntimeLoader["load"]>(() => ({
