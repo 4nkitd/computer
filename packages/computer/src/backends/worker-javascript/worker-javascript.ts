@@ -71,7 +71,7 @@ export interface WorkerJavaScriptBackendOptions {
   maxDirectoryEntries?: number;
   /** Maximum live replay subscribers per execution. Defaults to 8. */
   maxExecutionSubscribers?: number;
-  /** Completed execution retention window. Defaults to five minutes. */
+  /** Completed execution retention window. Defaults to 60 minutes. */
   retentionMs?: number;
   /** Maximum completed executions retained per backend. Defaults to 100. */
   maxRetainedExecutions?: number;
