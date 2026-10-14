@@ -145,7 +145,7 @@ Caller source can import four kinds of module, and all of them are fixed when th
 
 | Kind | Configured with | Runs in | Example |
 | --- | --- | --- | --- |
-| Built in | Always installed | The isolate, backed by the Workspace | `node:fs`, `node:fs/promises` |
+| Built in | Always installed | The isolate, backed by the Workspace | `node:fs`, `node:fs/promises`, `cf:computer` |
 | Node.js | `nodejs_compat` in `compatibilityFlags`, the default | The isolate, provided by the runtime | `node:path`, `node:crypto` |
 | Source | `modules: { name: "source" }` | The isolate | a bundled library |
 | Host | `modules: { "ws:name": { fn } }`, or a factory | The Durable Object | `ws:git`, `ws:container`, `ws:tools`, your own |
@@ -190,13 +190,56 @@ Code has no direct network access.
 Modules code can import:
 - `node:fs/promises` (also `node:fs`): the workspace's files. ...
 - `tar-stream`: a bundled library.
-- `ws:git`: The workspace's Git repository tools: `status({ dir })`, ...
+- `ws:git`: The workspace's Git repository: `status({ dir })`, ...
 - `ws:container`: Runs shell commands in a full Linux container that shares this workspace's files. ...
 - `ws:weather`: exports `forecast`.
+- `cf:computer`: `docs(module)` returns a module's TypeScript declarations and examples, ...
 - Node.js built-ins: `node:path`, `node:url`, ... Bare names such as `path` work too.
 ```
 
 A factory adds its own text through a `description` property, as the prebuilt modules do. The backend reads it each time it describes itself, not once when it is constructed, so a factory can define `description` as a getter and describe something that exists only later, as `ws:tools` does with the agent's tools. An object of functions is listed by its export names; say more about it in the `exec` tool's backend description if the model needs it.
+
+The description is one line per module, so it stays short in every prompt. The rest is in `cf:computer`, below.
+
+### `cf:computer`
+
+A host module's code runs in the Durable Object, so the isolate only holds stubs that forward each call. `String(fn)` on one shows nothing useful about how to call it. `cf:computer` is built in and gives code each module's TypeScript declarations instead:
+
+```js
+import * as git from "ws:git";
+import { docs, types } from "cf:computer";
+
+export default () => ({
+  modules: docs(),          // every module, one line each
+  git: docs(git),           // ws:git's summary, declarations, and examples, as markdown
+  cli: types(git.cli),      // one export's declaration, with the types it names
+  byName: types("ws:git"),  // a specifier works too, even for a module that failed to import
+});
+```
+
+Printing works the same way. `console.log(git.cli)` prints the export's declaration with a `{ [host code] }` body, as V8 prints a built-in function with `{ [native code] }`, and `console.log(git)` prints the whole module's declaration. `console.log`, `console.info`, `console.debug`, `console.warn`, `console.error`, and `console.dir` format other values the way Node.js does: `{ a: 1, b: 'x' }`, `Map(1) { 'k' => 1 }`, `[Circular]`, and an error's stack.
+
+A factory gives its declarations through a `types` property, keyed by the name each one declares. An entry named after an export declares that export. Any other entry declares a type the exports use, and is shown with each export that names it. `examples` adds short snippets to `docs`:
+
+```ts
+modules: {
+  "ws:weather": Object.assign(
+    () => ({ forecast: ([city]) => lookUpForecast(String(city)) }),
+    {
+      description: "The weather.",
+      types: {
+        Forecast: "interface Forecast { high: number; low: number }",
+        forecast: "/** The forecast for a city. */\nfunction forecast(city: string): Promise<Forecast>;",
+      },
+      examples: ['const { high } = await forecast("Lisbon");'],
+    },
+  ),
+}
+```
+
+The prebuilt modules all declare their exports, and `ws:tools` writes each tool's declaration from its description and input schema. An export with no declaration, such as one from a plain object of functions, is shown taking and returning `unknown`. `node:fs` and `node:fs/promises` are declared as the workspace implements them, which differs from Node.js in places: `stat().mtime` is a number, and there are no sync functions. A source module has no declarations, and a Node.js built-in is described as the Node.js API.
+
+The backend reads `types` and `examples` when it connects, with the functions the factory builds, so the two always agree. Like `description`, either can be a getter. Every specifier under `cf:` is reserved: no configured module may use one, and importing any other than `cf:computer` fails before the Worker is created.
 
 ### Built-in filesystem
 
@@ -271,7 +314,7 @@ Specifiers and the export names of an object are checked at construction. A fact
 import { clone, diff, status, log, cli } from "ws:git";
 ```
 
-`createGitModule()` from `@cloudflare/computer/modules/git` wraps the Workspace's Git client. Every `dir` and `cwd` is confined to the backend root, `clone` and `cli` need a read-write backend, and `cli` treats a leading `-C <path>` as its working directory, confined the same way, while rejecting any other `-C`, `--git-dir`, and `--work-tree`. Clone, fetch, pull, push, `ls-remote`, and submodule commands run from the host, even when the Dynamic Worker has `globalOutbound: null`, so they are denied unless you pass `createGitModule({ allowNetwork: true })`.
+`createGitModule()` from `@cloudflare/computer/modules/git` wraps the Workspace's Git client. Each export takes one options object, such as `cli({ argv: ["log", "--oneline"] })`, where `argv` leaves out `"git"`. A call that passes a string, an array, or an `argv` starting with `"git"` rejects with the shape it expects, rather than running git with no arguments. Every `dir` and `cwd` is confined to the backend root, `clone` and `cli` need a read-write backend, and `cli` treats a leading `-C <path>` as its working directory, confined the same way, while rejecting any other `-C`, `--git-dir`, and `--work-tree`. Clone, fetch, pull, push, `ls-remote`, and submodule commands run from the host, even when the Dynamic Worker has `globalOutbound: null`, so they are denied unless you pass `createGitModule({ allowNetwork: true })`.
 
 ### `ws:artifacts`
 
@@ -369,6 +412,17 @@ Pass a function of tools, rather than a list, when the tools need something that
 On a backend with `access: "read"`, only tools marked `readOnly` run. Every other call is refused before the tool runs, as `ws:git` and `ws:container` refuse to write there. `createToolBindings()` cannot tell what a tool does, so an unmarked tool is taken to write. `forPiTools()` marks `read`, `ls`, `find`, and `grep` from `createPiTools()`. For your own pi tools, name the ones that only read: `forPiTools(tools, { readOnly: ["read", "grep"] })`.
 
 The module's description lists the names code can import. With a function of tools, the function is called again each time the backend describes itself, so the `exec` tool, built after the Workspace, sees the current list. A list is read as given; any other iterable may be single-use, so it is not read for the description, and neither is a function that throws.
+
+A binding may also carry the tool's `description` and its `inputSchema` as JSON Schema, and `forPiTools()` and `forAISDKTools()` fill both in. The module then declares each export for `cf:computer`, so `types(read)` shows the arguments the tool takes:
+
+```ts
+/** Read a file. */
+function read(input: {
+  /** The file's path. */
+  path: string;
+  offset?: number;
+}): Promise<ToolResult>;
+```
 
 ### `ws:container`
 

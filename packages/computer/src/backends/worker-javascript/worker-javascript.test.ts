@@ -1049,6 +1049,22 @@ describe("WorkerJavaScriptBackend", () => {
     expect(backend.description).toContain("- `ws:plain`: a host module.");
   });
 
+  it("names cf:computer among its modules", () => {
+    const backend = new WorkerJavaScriptBackend({ loader: throwingLoader("must not load") });
+
+    expect(backend.description).toContain("- `cf:computer`: `docs(module)` returns");
+  });
+
+  it.each(["cf:computer", "cf:other"])("refuses a configured module named %s", (specifier) => {
+    expect(
+      () =>
+        new WorkerJavaScriptBackend({
+          loader: throwingLoader("must not load"),
+          modules: { [specifier]: "export const x = 1;" },
+        }),
+    ).toThrow(specifier === "cf:computer" ? /is built in/ : /cf:\* namespace/);
+  });
+
   it("lists the Node.js built-ins code can import", () => {
     const backend = new WorkerJavaScriptBackend({ loader: throwingLoader("must not load") });
 

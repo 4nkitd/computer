@@ -16,10 +16,12 @@ import type {
   WorkspaceRuntimeValue,
 } from "../../runtime/types.js";
 import { decodeRuntimeFrames, type RuntimeFrame } from "./frames.js";
+import type { ModuleCatalog } from "./introspection.js";
 import {
   assertHostModuleExports,
   buildModuleGraph,
   hasNodeModules,
+  moduleCatalog,
   NODE_MODULES_DESCRIPTION,
   type ParsedModules,
   parseModules,
@@ -269,6 +271,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   readonly #host: WorkspaceModuleBackendHost;
   readonly #hostModuleFunctions: ReadonlyMap<string, WorkspaceModuleFunctions>;
   readonly #emptyHostModules: ReadonlySet<string>;
+  readonly #catalog: ModuleCatalog;
   #sourceModules: Readonly<Record<string, string>> | undefined;
   readonly #records = new Map<string, ExecutionRecord>();
   readonly #pendingIds = new Set<string>();
@@ -303,6 +306,12 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     }
     this.#hostModuleFunctions = functions;
     this.#emptyHostModules = empty;
+    this.#catalog = moduleCatalog({
+      parsed: options.modules,
+      hostModules: functions,
+      emptyHostModules: empty,
+      nodeModules: hasNodeModules(options.compatibilityFlags),
+    });
     host.db.run(`
       CREATE TABLE IF NOT EXISTS workspace_runtime_executions (
         backend TEXT NOT NULL,
@@ -423,6 +432,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
         hostModules: this.#hostModuleFunctions,
         emptyHostModules: this.#emptyHostModules,
         nodeModules: hasNodeModules(this.#options.compatibilityFlags),
+        catalog: this.#catalog,
         maxSourceBytes: this.#options.maxSourceBytes,
         maxCapabilityBytes: this.#options.maxCapabilityBytes,
       });
@@ -1085,6 +1095,7 @@ function runtimeWorkerModule(entryName: string, maxStdioBytes: number) {
   return `
     import { WorkerEntrypoint } from "cloudflare:workers";
     import { install, moduleScopeRefusals } from "workspace-capabilities.js";
+    import { formatConsole, inspect } from "workspace-introspection.js";
 
     // A promise nobody awaits would otherwise fail without a trace while
     // the run reports success. Track the rejections nothing handled, and
@@ -1195,9 +1206,11 @@ function runtimeWorkerModule(entryName: string, maxStdioBytes: number) {
           }
           stdioTruncated = true;
         };
-        const consoleLine = (stream, args) => record(stream, args.map(String).join(" ") + "\\n");
+        const consoleLine = (stream, args) => record(stream, formatConsole(args) + "\\n");
         console.log = (...args) => consoleLine("stdout", args);
         console.info = (...args) => consoleLine("stdout", args);
+        console.debug = (...args) => consoleLine("stdout", args);
+        console.dir = (value) => record("stdout", inspect(value) + "\\n");
         console.warn = (...args) => consoleLine("stderr", args);
         console.error = (...args) => consoleLine("stderr", args);
         nextProcess.stdout = {
