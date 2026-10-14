@@ -1306,6 +1306,86 @@ describe("WorkerJavaScriptBackend", () => {
       }
     });
 
+    it("stops keeping the object alive for a run stuck finalizing past its timeout and host call deadline", async () => {
+      const db = new Database(new SQLiteTestStorage());
+      initializeSchema(db, () => 0);
+      const fs = new WorkspaceFilesystem(db);
+      await fs.mkdir("/workspace", { recursive: true });
+      let callStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        callStarted = resolve;
+      });
+      let releaseWrite!: () => void;
+      const writeReleased = new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      const originalWrite = fs.writeFile.bind(fs);
+      fs.writeFile = (async (...args: Parameters<typeof fs.writeFile>) => {
+        callStarted();
+        await writeReleased;
+        return originalWrite(...args);
+      }) as typeof fs.writeFile;
+      let now = 1_000_000;
+      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const backend = new WorkerJavaScriptBackend({
+          maxTimeoutMs: 10_000,
+          maxHostCallMs: 5_000,
+          loader: {
+            load() {
+              return {
+                getEntrypoint() {
+                  return {
+                    evaluate(
+                      _input: unknown,
+                      host: { call(name: string, args: unknown[]): Promise<unknown> },
+                    ) {
+                      void host.call("fs.writeFile", ["/workspace/output.txt", "done"]);
+                      return new Promise(() => undefined);
+                    },
+                  };
+                },
+              };
+            },
+          },
+        });
+        const handle = await backend.connect({
+          db,
+          fs,
+          git: undefined as never,
+          artifacts: undefined as never,
+          runtime: undefined as never,
+        });
+        await handle.exec({ id: "stuck", source: "export default 1", timeoutMs: 10_000 });
+        await started;
+        // The kill waits for the write, which never settles on its own.
+        const kill = handle.killExec({ id: "stuck" });
+
+        const call = setIntervalSpy.mock.calls.findIndex(([, ms]) => ms === 60_000);
+        const [tick] = setIntervalSpy.mock.calls[call] ?? [];
+        const timer = setIntervalSpy.mock.results[call]?.value;
+        expect(tick).toBeTypeOf("function");
+
+        now += 15_000;
+        (tick as () => void)();
+        expect(clearIntervalSpy).not.toHaveBeenCalledWith(timer);
+
+        now += 1;
+        (tick as () => void)();
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+
+        releaseWrite();
+        await kill;
+        await handle.close();
+      } finally {
+        nowSpy.mockRestore();
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
     it("schedules no timer when keepAliveIntervalMs is 0", async () => {
       const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
       try {

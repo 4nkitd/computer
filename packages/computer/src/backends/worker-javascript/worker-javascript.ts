@@ -81,6 +81,12 @@ export interface WorkerJavaScriptBackendOptions {
    * memory for as long as an execution is running. Keep the interval well
    * under 15 minutes.
    *
+   * An execution stops counting once its timeout plus `maxHostCallMs` has
+   * passed, even if it is still waiting for a host call to settle, so a
+   * host module that never settles can't keep the object in memory
+   * indefinitely. While the timer runs, the object is billed for duration
+   * and can't hibernate.
+   *
    * On earlier compatibility dates, pending work and timers do not keep a
    * Durable Object in memory, and an execution that outlives the request
    * that started it is evicted after about a minute. A host on an earlier
@@ -321,7 +327,9 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   readonly #activeStreams = new Map<string, number>();
   #pendingStarts = 0;
   readonly #pendingStartWaiters = new Set<() => void>();
-  readonly #running = new Set<string>();
+  // Running executions, each with the time after which it stops counting
+  // towards the keep-alive.
+  readonly #running = new Map<string, number>();
   #keepAlive: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: ResolvedWorkerJavaScriptBackendOptions, host: WorkspaceModuleBackendHost) {
@@ -500,7 +508,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
         throw error;
       }
       this.#records.set(id, record);
-      this.#markRunning(id);
+      this.#markRunning(id, timeoutMs);
       try {
         const bridge = new WorkspaceRuntimeBridge(capability, {
           hostModules: this.#hostModuleFunctions,
@@ -612,8 +620,13 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     this.#syncKeepAlive();
   }
 
-  #markRunning(id: string) {
-    this.#running.add(id);
+  // An execution normally settles by its timeout. Finalizing then waits
+  // for host calls it already accepted, which can take up to
+  // `maxHostCallMs` for a well-behaved host module. A run still going past
+  // both stops counting, so a host module that never settles can't keep
+  // the object in memory indefinitely.
+  #markRunning(id: string, timeoutMs: number) {
+    this.#running.set(id, Date.now() + timeoutMs + this.#options.maxHostCallMs);
     this.#syncKeepAlive();
   }
 
@@ -622,16 +635,27 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     this.#syncKeepAlive();
   }
 
-  // Hold the Durable Object in memory while any execution runs. The
-  // timer does nothing when it fires: scheduling it is what counts as
-  // pending work. See `keepAliveIntervalMs`.
+  // Hold the Durable Object in memory while any execution runs. Scheduling
+  // the timer is what counts as pending work; when it fires it only drops
+  // executions past their keep-alive deadline. See `keepAliveIntervalMs`.
   #syncKeepAlive() {
     if (this.#running.size > 0 && this.#options.keepAliveIntervalMs > 0) {
-      this.#keepAlive ??= setInterval(() => {}, this.#options.keepAliveIntervalMs);
+      this.#keepAlive ??= setInterval(
+        () => this.#expireKeepAlive(),
+        this.#options.keepAliveIntervalMs,
+      );
     } else if (this.#keepAlive !== undefined) {
       clearInterval(this.#keepAlive);
       this.#keepAlive = undefined;
     }
+  }
+
+  #expireKeepAlive() {
+    const now = Date.now();
+    for (const [id, until] of this.#running) {
+      if (now > until) this.#running.delete(id);
+    }
+    this.#syncKeepAlive();
   }
 
   get #backendId(): string {
