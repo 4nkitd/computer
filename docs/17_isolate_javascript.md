@@ -142,7 +142,7 @@ A deploy or a crash still ends a run. A deploy shuts the old instance down a few
 
 ## Interrupted executions
 
-A run that was in flight when its Durable Object restarted is settled by its `onInterrupt` policy. Set a default on the backend and override it per run:
+A run that was in flight when its Durable Object restarted is settled by its `onInterrupt` policy. Set a default on the backend and override it per run. The `"restart"` and `"replay"` policies are experimental: their behavior and stored format may change between minor releases, and a run interrupted across such an upgrade fails rather than resuming.
 
 ```ts
 const backend = new WorkerJavaScriptBackend({ loader: env.LOADER, onInterrupt: "replay" });
