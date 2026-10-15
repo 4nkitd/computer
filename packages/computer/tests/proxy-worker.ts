@@ -36,10 +36,13 @@ export class TestStorageDO extends DurableObject<Env> {
       });
     }
     if (url.pathname === "/api") {
-      return new Response(
-        url.searchParams.has("token") ? `from-do:${url.searchParams.get("token")}` : "from-do",
-        { status: 200 },
-      );
+      if (url.searchParams.has("token")) {
+        return new Response(`from-do:${url.searchParams.get("token")}`, { status: 200 });
+      }
+      if (this.ctx.id.name !== undefined) {
+        return new Response(`from-do:${this.ctx.id.name}`, { status: 200 });
+      }
+      return new Response("from-do", { status: 200 });
     }
     if (egressToken !== null) {
       return Response.json({
@@ -58,10 +61,11 @@ export default class TestDriver extends WorkerEntrypoint<Env> {
   override async fetch(request: Request): Promise<Response> {
     const binding = request.headers.get("x-test-binding") ?? "COMPUTERD";
     const id = request.headers.get("x-test-id") ?? "";
+    const name = request.headers.get("x-test-name") ?? undefined;
     const egressToken = request.headers.get("x-test-egress-token") ?? undefined;
     // oxlint-disable-next-line typescript/no-explicit-any -- ctx.exports isn't in @cloudflare/workers-types yet
     const proxy = (this.ctx as any).exports.WorkspaceProxy({
-      props: { binding, id, egressToken },
+      props: { binding, id, name, egressToken },
     });
     return proxy.fetch(request);
   }

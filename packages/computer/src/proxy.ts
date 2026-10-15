@@ -60,7 +60,23 @@ export interface WorkspaceProxyProps {
   // Stringified DurableObjectId — typically `ctx.id.toString()`
   // from inside the owning DO's constructor.
   id: string;
+  // Optional Durable Object name (`ctx.id.name`). When provided and
+  // matching `id`, the proxy addresses the DO via `idFromName(name)`
+  // so cold wakes preserve `ctx.id.name`.
+  name?: string;
   egressToken?: string;
+}
+
+function resolveTargetId(
+  ns: DurableObjectNamespace,
+  id: string,
+  name: string | undefined,
+): DurableObjectId {
+  if (name !== undefined && name.length > 0) {
+    const namedId = ns.idFromName(name);
+    if (namedId.toString() === id) return namedId;
+  }
+  return ns.idFromString(id);
 }
 
 export class WorkspaceProxy extends WorkerEntrypoint<unknown, WorkspaceProxyProps> {
@@ -108,9 +124,10 @@ export class WorkspaceProxy extends WorkerEntrypoint<unknown, WorkspaceProxyProp
   }
 
   #hostStub(): DurableObjectStub | undefined {
-    const { binding, id } = this.ctx.props;
+    const { binding, id, name } = this.ctx.props;
     const ns = (this.env as Record<string, unknown>)[binding] as DurableObjectNamespace | undefined;
-    return ns?.get(ns.idFromString(id));
+    if (ns === undefined) return undefined;
+    return ns.get(resolveTargetId(ns, id, name));
   }
 
   #missingBindingResponse(): Response {
@@ -177,6 +194,10 @@ export interface WorkspaceServiceProxyProps {
   // Stringified DurableObjectId — typically ctx.id.toString()
   // from inside the owning DO's constructor.
   id: string;
+  // Optional Durable Object name (`ctx.id.name`). When provided and
+  // matching `id`, the proxy addresses the DO via `idFromName(name)`
+  // so cold wakes preserve `ctx.id.name`.
+  name?: string;
 }
 
 export class WorkspaceServiceProxy extends WorkerEntrypoint<unknown, WorkspaceServiceProxyProps> {
@@ -217,13 +238,13 @@ export class WorkspaceServiceProxy extends WorkerEntrypoint<unknown, WorkspaceSe
   }
 
   #hostStub<T extends object>(): Rpc.DurableObjectBranded & T {
-    const { binding, id } = this.ctx.props;
+    const { binding, id, name } = this.ctx.props;
     const ns = (this.env as Record<string, unknown>)[binding] as
       | DurableObjectNamespace<Rpc.DurableObjectBranded & T>
       | undefined;
     if (!ns) {
       throw new Error(`WorkspaceServiceProxy: env.${binding} is not a DurableObjectNamespace`);
     }
-    return ns.get(ns.idFromString(id)) as unknown as Rpc.DurableObjectBranded & T;
+    return ns.get(resolveTargetId(ns, id, name)) as unknown as Rpc.DurableObjectBranded & T;
   }
 }

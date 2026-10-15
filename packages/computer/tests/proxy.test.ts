@@ -42,6 +42,32 @@ describe("WorkspaceProxy", () => {
     expect(await res.text()).toBe("from-do");
   });
 
+  it("/api preserves ctx.id.name when props.name matches props.id", async () => {
+    const name = "named-agent-instance";
+    const id = env.COMPUTERD.idFromName(name).toString();
+    const res = await SELF.fetch("http://proxy.test/api", {
+      headers: {
+        "x-test-id": id,
+        "x-test-name": name,
+        "x-test-binding": "COMPUTERD",
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(`from-do:${name}`);
+  });
+
+  it("/api falls back to idFromString when props.name does not match props.id", async () => {
+    const res = await SELF.fetch("http://proxy.test/api", {
+      headers: {
+        "x-test-id": freshId(),
+        "x-test-name": "mismatched-name",
+        "x-test-binding": "COMPUTERD",
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("from-do");
+  });
+
   it("accepts tokenized callback health and normalizes the tokenized callback to /api", async () => {
     const token = "123e4567-e89b-12d3-a456-426614174000";
     const health = await SELF.fetch(`http://proxy.test/__workspace_connect/${token}/health`, {

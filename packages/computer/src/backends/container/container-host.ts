@@ -50,6 +50,10 @@ export interface WorkspaceRef {
   binding: string;
   // Stringified DurableObjectId of the specific Workspace owner.
   id: string;
+  // Optional Durable Object name (`ctx.id.name`). When provided and
+  // matching `id`, WorkspaceProxy addresses the DO via `idFromName(name)`
+  // so cold wakes preserve `ctx.id.name`.
+  name?: string;
 }
 
 // Driver surface ContainerBackend talks to. Implemented
