@@ -76,7 +76,7 @@ A call made while the module loads fails the run with an error that names the ca
 
 The returned value becomes the result's `value` and must be JSON-compatible plain data. As with `JSON.stringify`, an `undefined` object field is left out, so `{ kept: 1, dropped: undefined }` completes as `{ kept: 1 }`, and returning `undefined` gives `null`. A function, a class instance such as a `Date`, an `undefined` array item, or a cycle fails the run. `options.input` is checked the same way.
 
-`runtime.exec()` returns before the Dynamic Worker finishes: the run keeps advancing while its event stream is consumed and the host call into the Dynamic Worker stays in flight. That pending work keeps the Durable Object resident on its own. A run whose handle is returned but never read can be evicted once the object goes idle; drain the event stream (or `result()`) to keep the run alive, and schedule an alarm through `ctx.storage.setAlarm()` for work that must survive eviction.
+`runtime.exec()` returns before the Dynamic Worker finishes, and the run keeps going whether or not anything reads its event stream. [Long-running executions](#long-running-executions) covers how long a run can last.
 
 ## Durable imports
 
@@ -114,6 +114,36 @@ Completed execution records remain available for replay for sixty minutes by def
 Cancellation stops new host capability calls, disposes the Dynamic Worker, and waits for host calls that were already accepted. Exit 130 is published only after those calls settle. Normal completion uses the same drain rule, so an unawaited capability call cannot mutate the workspace after exit 0.
 
 Host calls have a caller-visible deadline, controlled by `maxHostCallMs` and defaulting to `maxTimeoutMs`. Missing the deadline fails the capability call and marks the execution failed, even if caller code catches that error. Execution still waits for the accepted host operation itself before publishing a terminal event because many host APIs cannot roll back an external side effect after dispatch. Host module functions receive a `signal` in their context and must stop promptly when it aborts. A host module that ignores cancellation and never settles will keep execution in its finalizing state. `compatibilityDate` and `compatibilityFlags` control the Dynamic Worker runtime and default to the package-tested settings.
+
+## Long-running executions
+
+An execution runs until its code returns or its timeout passes, and `maxTimeoutMs` caps the timeout at 3 minutes by default. Several other limits apply to the whole execution, so a long run reaches them sooner:
+
+| Option | Default | Counts |
+|---|---|---|
+| `maxCapabilityCalls` | 256 | every filesystem and host module call |
+| `maxCapabilityRequestBytes` | 8 MiB | bytes sent to those calls, in total |
+| `maxCapabilityResponseBytes` | 8 MiB | bytes returned by those calls, in total |
+| `maxStdioBytes` | 1 MiB | standard output and standard error, in total; output past it is dropped |
+
+Raise the ones a long run needs along with the timeout:
+
+```ts
+new WorkerJavaScriptBackend({
+  loader: env.LOADER,
+  maxTimeoutMs: 2 * 60 * 60_000,
+  maxCapabilityCalls: 100_000,
+  maxCapabilityResponseBytes: 256 * 1024 * 1024,
+});
+```
+
+`maxHostCallMs` defaults to `maxTimeoutMs`, so it grows with it.
+
+A run also needs its Durable Object to stay in memory, and that depends on the host Worker's compatibility date. From 2026-10-01, each piece of pending work keeps a Durable Object in memory for up to 15 minutes from when it starts. A run that keeps making host calls or printing output keeps renewing that, but a quiet one, such as a run waiting on one slow `fetch`, would be evicted 15 minutes after it started. To cover that case, the backend schedules a timer every `keepAliveIntervalMs` (60 seconds by default) while any run is in flight, and each timer counts as new pending work. A run stops counting once its timeout plus `maxHostCallMs` has passed, even if it is still waiting for a host call to settle. While the timer runs, the object is billed for duration and can't hibernate. The backend reads the host Worker's compatibility flags when it connects and schedules the timer only from 2026-10-01, or with `durable_object_io_tasks_prevent_eviction`. On earlier compatibility dates, pending work and timers don't keep a Durable Object in memory, so no timer is scheduled, and a run that outlives the request that started it is evicted about a minute after that request ends, unless the request awaits the run or the host keeps the object in memory itself, for example with an alarm.
+
+CPU time is limited separately from wall-clock time. Each run's CPU limit is the smaller of its timeout and `maxCpuMs`, which defaults to `maxTimeoutMs`. CPU time adds up over the whole run, however much of it is spent waiting, and Cloudflare currently stops a Dynamic Worker call at about five minutes of CPU whatever the limit. A run that mostly waits on I/O uses little of that and can last hours. A run that computes heavily fails with `Worker exceeded CPU time limit.` once it reaches the cap. Every execution gets a fresh Dynamic Worker and a fresh CPU budget, so heavy work can be split across executions or moved to a container. The platform's subrequest limit, 10,000 by default on the Workers Paid plan, also counts every `fetch` over the whole run. A long run also holds one of the ten Dynamic Workers a Durable Object can have in flight for as long as it lasts.
+
+Nothing keeps a run going across a deploy or a crash. A deploy shuts the old instance down a few minutes later, and a run that was in flight is marked as failed the next time the backend connects.
 
 ## Environment, standard input, and the `process` shim
 

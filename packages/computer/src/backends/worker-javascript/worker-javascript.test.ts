@@ -1241,6 +1241,319 @@ describe("WorkerJavaScriptBackend", () => {
     await workspace.close();
   });
 
+  describe("keep-alive", () => {
+    function gatedWorkspace(options: { keepAliveIntervalMs?: number } = {}) {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let started = 0;
+      const workspace = new Workspace({
+        storage: new SQLiteTestStorage(),
+        backends: [
+          new WorkerJavaScriptBackend({
+            ...options,
+            loader: {
+              load() {
+                return {
+                  getEntrypoint() {
+                    return {
+                      evaluate: (
+                        _input: unknown,
+                        host: {
+                          assertResult(value: unknown): Promise<void>;
+                          attachOutput(readable: ReadableStream<Uint8Array>): Promise<void>;
+                        },
+                      ) => {
+                        started += 1;
+                        return released.then(() => evaluateResult(host, 1));
+                      },
+                    };
+                  },
+                };
+              },
+            },
+          }),
+        ],
+      });
+      return { workspace, release, started: () => started };
+    }
+
+    it("keeps a timer scheduled while an execution runs and clears it once none do", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const first = await workspace.runtime.exec("export default 1", { id: "first" });
+        const second = await workspace.runtime.exec("export default 1", { id: "second" });
+        await vi.waitFor(() => expect(started()).toBe(2));
+
+        const keepAliveCalls = setIntervalSpy.mock.calls.filter(([, ms]) => ms === 60_000);
+        expect(keepAliveCalls).toHaveLength(1);
+        const timer =
+          setIntervalSpy.mock.results[setIntervalSpy.mock.calls.indexOf(keepAliveCalls[0])]?.value;
+        expect(clearIntervalSpy).not.toHaveBeenCalledWith(timer);
+
+        release();
+        await first.result();
+        await second.result();
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
+    it("stops keeping the object alive for a run stuck finalizing past its timeout and host call deadline", async () => {
+      const db = new Database(new SQLiteTestStorage());
+      initializeSchema(db, () => 0);
+      const fs = new WorkspaceFilesystem(db);
+      await fs.mkdir("/workspace", { recursive: true });
+      let callStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        callStarted = resolve;
+      });
+      let releaseWrite!: () => void;
+      const writeReleased = new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      const originalWrite = fs.writeFile.bind(fs);
+      fs.writeFile = (async (...args: Parameters<typeof fs.writeFile>) => {
+        callStarted();
+        await writeReleased;
+        return originalWrite(...args);
+      }) as typeof fs.writeFile;
+      let now = 1_000_000;
+      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const backend = new WorkerJavaScriptBackend({
+          maxTimeoutMs: 10_000,
+          maxHostCallMs: 5_000,
+          loader: {
+            load() {
+              return {
+                getEntrypoint() {
+                  return {
+                    evaluate(
+                      _input: unknown,
+                      host: { call(name: string, args: unknown[]): Promise<unknown> },
+                    ) {
+                      void host.call("fs.writeFile", ["/workspace/output.txt", "done"]);
+                      return new Promise(() => undefined);
+                    },
+                  };
+                },
+              };
+            },
+          },
+        });
+        const handle = await backend.connect({
+          db,
+          fs,
+          git: undefined as never,
+          artifacts: undefined as never,
+          runtime: undefined as never,
+        });
+        await handle.exec({ id: "stuck", source: "export default 1", timeoutMs: 10_000 });
+        await started;
+        // The kill waits for the write, which never settles on its own.
+        const kill = handle.killExec({ id: "stuck" });
+
+        const call = setIntervalSpy.mock.calls.findIndex(([, ms]) => ms === 60_000);
+        const [tick] = setIntervalSpy.mock.calls[call] ?? [];
+        const timer = setIntervalSpy.mock.results[call]?.value;
+        expect(tick).toBeTypeOf("function");
+
+        now += 15_000;
+        (tick as () => void)();
+        expect(clearIntervalSpy).not.toHaveBeenCalledWith(timer);
+
+        now += 1;
+        (tick as () => void)();
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+
+        releaseWrite();
+        await kill;
+        await handle.close();
+      } finally {
+        nowSpy.mockRestore();
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
+    it("schedules no timer when keepAliveIntervalMs is 0", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace({ keepAliveIntervalMs: 0 });
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(1));
+        expect(setIntervalSpy).not.toHaveBeenCalled();
+        release();
+        await handle.result();
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+      }
+    });
+
+    // The timer's id from the one setInterval call the keep-alive makes.
+    function keepAliveTimer(setIntervalSpy: {
+      mock: { calls: unknown[][]; results: { value: unknown }[] };
+    }) {
+      const call = setIntervalSpy.mock.calls.findIndex(([, ms]) => ms === 60_000);
+      expect(call).not.toBe(-1);
+      return setIntervalSpy.mock.results[call]?.value;
+    }
+
+    it("clears the timer when the last execution is killed", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const { workspace, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1", { id: "killed" });
+        await vi.waitFor(() => expect(started()).toBe(1));
+        const timer = keepAliveTimer(setIntervalSpy);
+        await workspace.runtime.killExec("killed");
+        await expect(handle.result()).resolves.toMatchObject({ status: "cancelled" });
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
+    it("clears the timer when the Workspace closes with executions running", async () => {
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      try {
+        const { workspace, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        await workspace.runtime.exec("export default 1");
+        await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(2));
+        const timer = keepAliveTimer(setIntervalSpy);
+        await workspace.close();
+        expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+      } finally {
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
+
+    it("schedules no timer when the host's pending work can't keep the object in memory", async () => {
+      vi.stubGlobal("Cloudflare", {
+        compatibilityFlags: { durable_object_io_tasks_prevent_eviction: false },
+      });
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(1));
+        expect(setIntervalSpy.mock.calls.filter(([, ms]) => ms === 60_000)).toHaveLength(0);
+        release();
+        await handle.result();
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("schedules the timer when the host's pending work keeps the object in memory", async () => {
+      vi.stubGlobal("Cloudflare", {
+        compatibilityFlags: { durable_object_io_tasks_prevent_eviction: true },
+      });
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+      try {
+        const { workspace, release, started } = gatedWorkspace();
+        await workspace.fs.mkdir("/workspace", { recursive: true });
+        const handle = await workspace.runtime.exec("export default 1");
+        await vi.waitFor(() => expect(started()).toBe(1));
+        keepAliveTimer(setIntervalSpy);
+        release();
+        await handle.result();
+        await workspace.close();
+      } finally {
+        setIntervalSpy.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("rejects a keepAliveIntervalMs that is negative, non-finite, or 15 minutes or more", () => {
+      for (const keepAliveIntervalMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, 900_000]) {
+        expect(
+          () =>
+            new WorkerJavaScriptBackend({ loader: throwingLoader("unused"), keepAliveIntervalMs }),
+        ).toThrow(/keepAliveIntervalMs/);
+      }
+    });
+  });
+
+  describe("CPU limit", () => {
+    function recordingLoader() {
+      return vi.fn<WorkspaceRuntimeLoader["load"]>(() => ({
+        getEntrypoint() {
+          return {
+            evaluate: (
+              _input: unknown,
+              host: {
+                assertResult(value: unknown): Promise<void>;
+                attachOutput(readable: ReadableStream<Uint8Array>): Promise<void>;
+              },
+            ) => evaluateResult(host, null),
+          };
+        },
+      }));
+    }
+
+    it("defaults the CPU limit to the execution timeout", async () => {
+      const load = recordingLoader();
+      const workspace = new Workspace({
+        storage: new SQLiteTestStorage(),
+        backends: [new WorkerJavaScriptBackend({ loader: { load } })],
+      });
+      await workspace.fs.mkdir("/workspace", { recursive: true });
+      await (await workspace.runtime.exec("export default null", { timeoutMs: 45_000 })).result();
+      expect(load.mock.calls[0]?.[0]).toMatchObject({ limits: { cpuMs: 45_000 } });
+      await workspace.close();
+    });
+
+    it("caps the CPU limit at maxCpuMs without shortening the timeout", async () => {
+      const load = recordingLoader();
+      const workspace = new Workspace({
+        storage: new SQLiteTestStorage(),
+        backends: [
+          new WorkerJavaScriptBackend({
+            loader: { load },
+            maxTimeoutMs: 60 * 60_000,
+            maxCpuMs: 300_000,
+          }),
+        ],
+      });
+      await workspace.fs.mkdir("/workspace", { recursive: true });
+      await (
+        await workspace.runtime.exec("export default null", { timeoutMs: 30 * 60_000 })
+      ).result();
+      expect(load.mock.calls[0]?.[0]).toMatchObject({ limits: { cpuMs: 300_000 } });
+      await workspace.close();
+    });
+
+    it("rejects a maxCpuMs that is not positive and finite", () => {
+      expect(
+        () => new WorkerJavaScriptBackend({ loader: throwingLoader("unused"), maxCpuMs: 0 }),
+      ).toThrow(/maxCpuMs/);
+    });
+  });
+
   it("rejects relative imports that collide with internal Loader modules", async () => {
     const load = vi.fn<WorkspaceRuntimeLoader["load"]>();
     const workspace = new Workspace({

@@ -54,6 +54,50 @@ export interface WorkerJavaScriptBackendOptions {
   modules?: Record<string, WorkspaceModule>;
   defaultTimeoutMs?: number;
   maxTimeoutMs?: number;
+  /**
+   * The most CPU time one execution can use, in milliseconds. Each
+   * execution's CPU limit is the smaller of its timeout and this value.
+   * Defaults to `maxTimeoutMs`, which makes the CPU limit the timeout.
+   *
+   * CPU time adds up over the whole execution, however much of it is spent
+   * waiting. Cloudflare currently stops a Dynamic Worker call at about five
+   * minutes of CPU whatever the limit, so values above 300000 have no
+   * effect.
+   */
+  maxCpuMs?: number;
+  /**
+   * How often to schedule a timer while any execution is running, in
+   * milliseconds. Set it to 0 to turn the timer off. Defaults to 60
+   * seconds.
+   *
+   * From compatibility date 2026-10-01, each piece of pending work keeps
+   * a Durable Object in memory for at most 15 minutes from when it starts.
+   * An execution is one call into a Dynamic Worker, so one that goes
+   * quiet, making no host calls and printing nothing, is evicted about 15
+   * minutes after it starts, and the eviction ends it. Host calls and
+   * output also keep the object in memory while they keep coming, but an
+   * execution can't be relied on to make them. Every timer counts as new
+   * pending work, so a timer that keeps rescheduling holds the object in
+   * memory for as long as an execution is running. The interval must be
+   * under 15 minutes.
+   *
+   * The backend reads the host Worker's compatibility flags and schedules
+   * the timer only where it helps, from 2026-10-01 or with
+   * `durable_object_io_tasks_prevent_eviction`.
+   *
+   * An execution stops counting once its timeout plus `maxHostCallMs` has
+   * passed, even if it is still waiting for a host call to settle, so a
+   * host module that never settles can't keep the object in memory
+   * indefinitely. While the timer runs, the object is billed for duration
+   * and can't hibernate.
+   *
+   * On earlier compatibility dates, pending work and timers do not keep a
+   * Durable Object in memory, so no timer is scheduled, and an execution
+   * that outlives the request that started it is evicted after about a
+   * minute. A host on an earlier date needs its own keep-alive, such as an
+   * alarm.
+   */
+  keepAliveIntervalMs?: number;
   maxSourceBytes?: number;
   maxInputBytes?: number;
   maxStdinBytes?: number;
@@ -71,7 +115,7 @@ export interface WorkerJavaScriptBackendOptions {
   maxDirectoryEntries?: number;
   /** Maximum live replay subscribers per execution. Defaults to 8. */
   maxExecutionSubscribers?: number;
-  /** Completed execution retention window. Defaults to five minutes. */
+  /** Completed execution retention window. Defaults to 60 minutes. */
   retentionMs?: number;
   /** Maximum completed executions retained per backend. Defaults to 100. */
   maxRetainedExecutions?: number;
@@ -88,6 +132,8 @@ type ResolvedWorkerJavaScriptBackendOptions = Required<
     | "access"
     | "defaultTimeoutMs"
     | "maxTimeoutMs"
+    | "maxCpuMs"
+    | "keepAliveIntervalMs"
     | "maxSourceBytes"
     | "maxInputBytes"
     | "maxStdinBytes"
@@ -170,6 +216,20 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
     const defaultTimeoutMs = options.defaultTimeoutMs ?? Math.min(60_000, maxTimeoutMs);
     assertPositiveFinite(maxTimeoutMs, "maxTimeoutMs");
     assertPositiveFinite(defaultTimeoutMs, "defaultTimeoutMs");
+    const maxCpuMs = options.maxCpuMs ?? maxTimeoutMs;
+    assertPositiveFinite(maxCpuMs, "maxCpuMs");
+    const keepAliveIntervalMs = options.keepAliveIntervalMs ?? 60_000;
+    // Pending work protects a Durable Object for at most 15 minutes, so a
+    // longer interval would leave gaps.
+    if (
+      !Number.isFinite(keepAliveIntervalMs) ||
+      keepAliveIntervalMs < 0 ||
+      keepAliveIntervalMs >= 900_000
+    ) {
+      throw new Error(
+        "WorkerJavaScriptBackend keepAliveIntervalMs must be zero or less than 15 minutes.",
+      );
+    }
     assertPositiveFinite(options.maxSourceBytes ?? 1024 * 1024, "maxSourceBytes");
     assertPositiveFinite(options.maxInputBytes ?? 1024 * 1024, "maxInputBytes");
     assertPositiveFinite(options.maxStdinBytes ?? 256 * 1024, "maxStdinBytes");
@@ -221,6 +281,8 @@ export class WorkerJavaScriptBackend implements WorkspaceModuleBackend {
       access: options.access ?? "read-write",
       defaultTimeoutMs,
       maxTimeoutMs,
+      maxCpuMs,
+      keepAliveIntervalMs,
       maxSourceBytes: options.maxSourceBytes ?? 1024 * 1024,
       maxInputBytes: options.maxInputBytes ?? 1024 * 1024,
       maxStdinBytes: options.maxStdinBytes ?? 256 * 1024,
@@ -276,9 +338,16 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   readonly #activeStreams = new Map<string, number>();
   #pendingStarts = 0;
   readonly #pendingStartWaiters = new Set<() => void>();
+  // Running executions, each with the time after which it stops counting
+  // towards the keep-alive.
+  readonly #running = new Map<string, number>();
+  #keepAlive: ReturnType<typeof setInterval> | undefined;
+  // Zero when the timer is off or can't keep this object in memory.
+  readonly #keepAliveIntervalMs: number;
 
   constructor(options: ResolvedWorkerJavaScriptBackendOptions, host: WorkspaceModuleBackendHost) {
     this.#options = options;
+    this.#keepAliveIntervalMs = hostKeepsPendingWork() ? options.keepAliveIntervalMs : 0;
     this.#host = host;
     const functions = new Map<string, WorkspaceModuleFunctions>();
     const empty = new Set<string>();
@@ -453,6 +522,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
         throw error;
       }
       this.#records.set(id, record);
+      this.#markRunning(id, timeoutMs);
       try {
         const bridge = new WorkspaceRuntimeBridge(capability, {
           hostModules: this.#hostModuleFunctions,
@@ -478,6 +548,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
           },
           bridge,
           timeoutMs,
+          cpuMs: Math.min(timeoutMs, this.#options.maxCpuMs),
           egress: this.#options.egress,
           compatibilityDate: this.#options.compatibilityDate,
           compatibilityFlags: this.#options.compatibilityFlags,
@@ -559,6 +630,43 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     await Promise.allSettled(finalizations);
     for (const record of records) this.#close(record);
     this.#records.clear();
+    this.#running.clear();
+    this.#syncKeepAlive();
+  }
+
+  // An execution normally settles by its timeout. Finalizing then waits
+  // for host calls it already accepted, which can take up to
+  // `maxHostCallMs` for a well-behaved host module. A run still going past
+  // both stops counting, so a host module that never settles can't keep
+  // the object in memory indefinitely.
+  #markRunning(id: string, timeoutMs: number) {
+    this.#running.set(id, Date.now() + timeoutMs + this.#options.maxHostCallMs);
+    this.#syncKeepAlive();
+  }
+
+  #markSettled(id: string) {
+    this.#running.delete(id);
+    this.#syncKeepAlive();
+  }
+
+  // Hold the Durable Object in memory while any execution runs. Scheduling
+  // the timer is what counts as pending work; when it fires it only drops
+  // executions past their keep-alive deadline. See `keepAliveIntervalMs`.
+  #syncKeepAlive() {
+    if (this.#running.size > 0 && this.#keepAliveIntervalMs > 0) {
+      this.#keepAlive ??= setInterval(() => this.#expireKeepAlive(), this.#keepAliveIntervalMs);
+    } else if (this.#keepAlive !== undefined) {
+      clearInterval(this.#keepAlive);
+      this.#keepAlive = undefined;
+    }
+  }
+
+  #expireKeepAlive() {
+    const now = Date.now();
+    for (const [id, until] of this.#running) {
+      if (now > until) this.#running.delete(id);
+    }
+    this.#syncKeepAlive();
   }
 
   get #backendId(): string {
@@ -850,6 +958,7 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
     }
     record.status = settledStatus;
     record.events.push(...settledEvents);
+    this.#markSettled(record.id);
     for (const subscriber of [...record.subscribers]) this.#pump(record, subscriber);
     this.#close(record);
     if (!record.persistenceFailed) {
@@ -954,6 +1063,19 @@ class JavaScriptBackendHandle implements WorkspaceModuleBackendHandle {
   }
 }
 
+// Whether pending work keeps this Durable Object in memory, which the host
+// Worker's compatibility date decides: from 2026-10-01 it does, before it
+// doesn't, and a keep-alive timer would do nothing. The Dynamic Worker's
+// own compatibility date plays no part. Outside the Workers runtime the
+// flags aren't there to read, and the timer is scheduled, which is
+// harmless.
+function hostKeepsPendingWork(): boolean {
+  const flags = (
+    globalThis as { Cloudflare?: { compatibilityFlags?: Record<string, boolean | undefined> } }
+  ).Cloudflare?.compatibilityFlags;
+  return flags?.durable_object_io_tasks_prevent_eviction ?? true;
+}
+
 function encodeEvent(event: WorkspaceRuntimeEvent): Uint8Array {
   if (event.name === "stdout" || event.name === "stderr") return event.value;
   const payload =
@@ -988,6 +1110,7 @@ function startJavaScriptExecution(options: {
   context: WorkspaceExecutionContext;
   bridge: WorkspaceRuntimeBridge;
   timeoutMs: number;
+  cpuMs: number;
   egress: WorkspaceEgressPolicy;
   compatibilityDate: string;
   compatibilityFlags: string[];
@@ -1004,7 +1127,7 @@ function startJavaScriptExecution(options: {
   const worker = options.loader.load({
     compatibilityDate: options.compatibilityDate,
     compatibilityFlags: options.compatibilityFlags,
-    limits: { cpuMs: options.timeoutMs },
+    limits: { cpuMs: options.cpuMs },
     mainModule: "workspace-runtime-runner.js",
     modules,
     ...dynamicWorkerEgress(options.egress),
@@ -1012,7 +1135,7 @@ function startJavaScriptExecution(options: {
   let entrypoint: JavaScriptEntrypoint;
   try {
     entrypoint = worker.getEntrypoint(undefined, {
-      limits: { cpuMs: options.timeoutMs },
+      limits: { cpuMs: options.cpuMs },
     }) as JavaScriptEntrypoint;
   } catch (error) {
     disposeQuietly(worker as { [Symbol.dispose]?: () => void });
